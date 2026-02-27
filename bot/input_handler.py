@@ -14,6 +14,37 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.05
 
 
+import ctypes
+from ctypes import wintypes
+
+MOUSEEVENTF_XDOWN = 0x0080
+MOUSEEVENTF_XUP   = 0x0100
+XBUTTON1 = 0x0001  # Mouse4 (back)
+XBUTTON2 = 0x0002  # Mouse5 (forward)
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.c_long),
+        ("dy", ctypes.c_long),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
+
+def click_mouse4():
+    x_down = INPUT(type=0, mi=MOUSEINPUT(
+        dx=0, dy=0, mouseData=XBUTTON1,
+        dwFlags=MOUSEEVENTF_XDOWN, time=0, dwExtraInfo=None))
+    x_up = INPUT(type=0, mi=MOUSEINPUT(
+        dx=0, dy=0, mouseData=XBUTTON1,
+        dwFlags=MOUSEEVENTF_XUP, time=0, dwExtraInfo=None))
+    ctypes.windll.user32.SendInput(1, ctypes.byref(x_down), ctypes.sizeof(INPUT))
+    ctypes.windll.user32.SendInput(1, ctypes.byref(x_up), ctypes.sizeof(INPUT))
+
 class InputHandler:
     """Wraps pyautogui to provide click / key-press helpers."""
 
