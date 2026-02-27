@@ -1,67 +1,32 @@
 """
-bot/input_handler.py – mouse and keyboard actions
+bot/input_handler.py – mouse and keyboard actions (Interception driver)
 """
 
 from __future__ import annotations
 
-import time
+from bot.interception_wrapper import Interception
 
-import pyautogui
-
-# Safety setting: move mouse to corner to abort
-pyautogui.FAILSAFE = True
-# Pause between pyautogui calls (seconds)
-pyautogui.PAUSE = 0.05
-
-
-import ctypes
-from ctypes import wintypes
-
-MOUSEEVENTF_XDOWN = 0x0080
-MOUSEEVENTF_XUP   = 0x0100
-XBUTTON1 = 0x0001  # Mouse4 (back)
-XBUTTON2 = 0x0002  # Mouse5 (forward)
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", ctypes.c_long),
-        ("dy", ctypes.c_long),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
-
-def click_mouse4():
-    x_down = INPUT(type=0, mi=MOUSEINPUT(
-        dx=0, dy=0, mouseData=XBUTTON1,
-        dwFlags=MOUSEEVENTF_XDOWN, time=0, dwExtraInfo=None))
-    x_up = INPUT(type=0, mi=MOUSEINPUT(
-        dx=0, dy=0, mouseData=XBUTTON1,
-        dwFlags=MOUSEEVENTF_XUP, time=0, dwExtraInfo=None))
-    ctypes.windll.user32.SendInput(1, ctypes.byref(x_down), ctypes.sizeof(INPUT))
-    ctypes.windll.user32.SendInput(1, ctypes.byref(x_up), ctypes.sizeof(INPUT))
 
 class InputHandler:
-    """Wraps pyautogui to provide click / key-press helpers."""
+    """Wraps Interception driver to provide click / key-press helpers."""
+
+    def __init__(self) -> None:
+        self._drv = Interception()
 
     # ── Mouse ─────────────────────────────────────────────────────────
 
     def click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> None:
         """Move to (x, y) and click."""
-        pyautogui.click(x, y, button=button, clicks=clicks)
+        self._drv.click(x, y, button=button, clicks=clicks)
 
     def double_click(self, x: int, y: int) -> None:
-        pyautogui.doubleClick(x, y)
+        self._drv.double_click(x, y)
 
     def right_click(self, x: int, y: int) -> None:
-        pyautogui.rightClick(x, y)
+        self._drv.right_click(x, y)
 
-    def move_to(self, x: int, y: int, duration: float = 0.1) -> None:
-        pyautogui.moveTo(x, y, duration=duration)
+    def move_to(self, x: int, y: int) -> None:
+        self._drv.move_to(x, y)
 
     def drag_to(
         self,
@@ -72,27 +37,26 @@ class InputHandler:
         duration: float = 0.3,
         button: str = "left",
     ) -> None:
-        pyautogui.moveTo(x1, y1)
-        pyautogui.dragTo(x2, y2, duration=duration, button=button)
+        self._drv.drag_to(x1, y1, x2, y2, duration=duration, button=button)
 
     # ── Keyboard ──────────────────────────────────────────────────────
 
     def press(self, key: str) -> None:
         """Tap a single key (e.g. 'f1', 'enter', 'space')."""
-        pyautogui.press(key)
+        self._drv.press(key)
 
     def hotkey(self, *keys: str) -> None:
         """Press a combination of keys (e.g. 'ctrl', 'a')."""
-        pyautogui.hotkey(*keys)
+        self._drv.hotkey(*keys)
 
     def type_text(self, text: str, interval: float = 0.05) -> None:
-        pyautogui.typewrite(text, interval=interval)
+        self._drv.type_text(text, interval=interval)
 
     def key_down(self, key: str) -> None:
-        pyautogui.keyDown(key)
+        self._drv.key_down(key)
 
     def key_up(self, key: str) -> None:
-        pyautogui.keyUp(key)
+        self._drv.key_up(key)
 
     # ── Utilities ─────────────────────────────────────────────────────
 

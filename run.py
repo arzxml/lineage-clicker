@@ -7,6 +7,8 @@ Usage:
 
     # On PC2 (acts as client, connecting to PC1):
     python run.py --role client --host 192.168.1.X
+
+    Stop the bot: press Ctrl+C in the terminal.
 """
 
 from __future__ import annotations
@@ -16,13 +18,15 @@ import asyncio
 import logging
 import time
 
+import mss
+
 import config
 from bot.screen import ScreenCapture, TemplateMatcher
 from bot.input_handler import InputHandler
 from bot.network.event_bus import EventBus
 from bot.network.server import NetworkServer
 from bot.network.client import NetworkClient
-from bot.scenarios import SCENARIO_REGISTRY
+from bot.scenarios import ScenarioRunner, BotStopRequested
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -42,18 +46,24 @@ async def bot_loop(
     capture = ScreenCapture()
     matcher = TemplateMatcher()
     ih = InputHandler()
+    scenarios = ScenarioRunner()
 
-    active_scenarios = [
-        SCENARIO_REGISTRY[name]
-        for name in config.ACTIVE_SCENARIOS
-        if name in SCENARIO_REGISTRY
-    ]
+    # Focus the game window by clicking center of the game monitor
+    with mss.mss() as sct:
+        mon = sct.monitors[config.MONITOR_INDEX]
+        cx = mon["left"] + mon["width"] // 2
+        cy = mon["top"] + mon["height"] // 2
+    log.info(f"[bot] clicking game monitor center ({cx}, {cy}) to focus")
+    ih.click(cx, cy)
+    await asyncio.sleep(0.3)
+
+    active_scenarios = scenarios.get_scenarios(config.ACTIVE_SCENARIOS)
 
     interval = 1.0 / max(config.CAPTURE_FPS, 1)
     log.info(f"[bot] starting loop at {config.CAPTURE_FPS} FPS "
              f"with scenarios: {config.ACTIVE_SCENARIOS}")
+    log.info("[bot] press Ctrl+C in the terminal to stop")
 
-    # Drain any queued remote events each tick
     while True:
         tick_start = time.monotonic()
 
@@ -67,16 +77,16 @@ async def bot_loop(
 
         # Run each active scenario once per tick
         for scenario_fn in active_scenarios:
-            # Pass the first remote event if any (you can extend this)
             ev = remote_events[0] if remote_events else None
             try:
                 await scenario_fn(frame, matcher, ih, bus, ev)
+            except BotStopRequested as stop:
+                log.info(f"[bot] stop requested: {stop}")
+                return
             except Exception as exc:
                 log.exception(f"[bot] scenario {scenario_fn.__name__} error: {exc}")
 
         # Forward locally-published events to the other PC
-        # (events published inside scenarios end up in the queue again;
-        #  here we re-drain and broadcast only _local_ events)
         while not bus._queue.empty():
             local_event = await bus.next_event()
             bus.task_done()
@@ -100,7 +110,6 @@ async def main(role: str, host: str) -> None:
         sender = net.broadcast
         network_task = asyncio.create_task(net.start())
     else:
-        # Override host from CLI arg
         config.SERVER_HOST = host
         net = NetworkClient(bus)
         sender = net.send
@@ -110,8 +119,8 @@ async def main(role: str, host: str) -> None:
 
     try:
         await asyncio.gather(network_task, bot_task)
-    except KeyboardInterrupt:
-        log.info("Shutting down …")
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        log.info("[bot] shutting down …")
 
 
 if __name__ == "__main__":
@@ -136,4 +145,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config.SERVER_PORT = args.port
 
-    asyncio.run(main(args.role, args.host))
+    try:
+        asyncio.run(main(args.role, args.host))
+    except KeyboardInterrupt:
+        log.info("[bot] stopped")

@@ -14,6 +14,9 @@ import numpy as np
 
 import config
 
+# Region of interest: (x, y, width, height) in screen pixels
+Region = tuple[int, int, int, int]
+
 
 class ScreenCapture:
     """Captures the game monitor at a configured FPS."""
@@ -65,9 +68,16 @@ class TemplateMatcher:
         frame: np.ndarray,
         template_name: str,
         threshold: float = config.MATCH_THRESHOLD,
+        region: Region | None = None,
     ) -> Optional[tuple[int, int, float]]:
         """
         Search for a named template in *frame*.
+
+        Parameters
+        ----------
+        region : (x, y, w, h) or None
+            If given, only search within this rectangle of the frame.
+            Returned coordinates are still in full-frame (screen) space.
 
         Returns (center_x, center_y, confidence) if found, else None.
         """
@@ -75,13 +85,32 @@ class TemplateMatcher:
         if tpl is None:
             return None
 
-        result = cv2.matchTemplate(frame, tpl, cv2.TM_CCOEFF_NORMED)
+        # Crop to region of interest if specified
+        ox, oy = 0, 0
+        search_area = frame
+        if region is not None:
+            rx, ry, rw, rh = region
+            # Clamp to frame boundaries
+            rx = max(0, rx)
+            ry = max(0, ry)
+            rw = min(rw, frame.shape[1] - rx)
+            rh = min(rh, frame.shape[0] - ry)
+            ox, oy = rx, ry
+            search_area = frame[ry:ry + rh, rx:rx + rw]
+
+        # Template must be smaller than or equal to search area
+        th, tw = tpl.shape[:2]
+        sh, sw = search_area.shape[:2]
+        if th > sh or tw > sw:
+            return None
+
+        result = cv2.matchTemplate(search_area, tpl, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
         if max_val >= threshold:
             h, w = tpl.shape[:2]
-            cx = max_loc[0] + w // 2
-            cy = max_loc[1] + h // 2
+            cx = ox + max_loc[0] + w // 2
+            cy = oy + max_loc[1] + h // 2
             return cx, cy, float(max_val)
         return None
 
@@ -89,11 +118,12 @@ class TemplateMatcher:
         self,
         frame: np.ndarray,
         threshold: float = config.MATCH_THRESHOLD,
+        region: Region | None = None,
     ) -> dict[str, tuple[int, int, float]]:
         """Return every template that is currently visible on screen."""
         found = {}
         for name in self._templates:
-            hit = self.find(frame, name, threshold)
+            hit = self.find(frame, name, threshold, region=region)
             if hit:
                 found[name] = hit
         return found
