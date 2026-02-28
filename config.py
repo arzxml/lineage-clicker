@@ -31,6 +31,7 @@ ACTIVE_SCENARIOS: list[str] = [
     "read_character_stats",
     "check_skill_availability",
     "use_buff_skills",
+    "manage_toggle_skills",
     "check_target_died",
     "loot_on_dead_target",
     "check_mobs_in_range",
@@ -83,6 +84,7 @@ PRE_ORIENT_HP_THRESHOLD = 0.10  # roughly ≈15 % HP remaining
 
 # Skill availability
 SKILL_CHECK_INTERVAL = 10.0     # seconds between skill-window checks
+SKILL_BRIGHTNESS_RATIO = 0.90   # if matched region brightness < ratio * template brightness → on cooldown
 
 # Combat skills to use during fights (template name = "skill-{key}").
 # Each entry: conditions (when to use), pre/post actions.
@@ -91,7 +93,20 @@ COMBAT_SKILLS: dict[str, dict] = {}
 # Toggle skills that can be switched on/off (e.g. Vicious Stance).
 # Always considered available — no hot-bar availability tracking needed.
 # Each entry: conditions (when to toggle on/off), pre/post actions.
-TOGGLE_SKILLS: dict[str, dict] = {}
+TOGGLE_SKILLS: dict[str, dict] = {
+        "Vicious Stance": {
+            "conditions": {
+                "enable": {
+                    "mp_above_percent": 60
+                },
+                "disable": {
+                    "mp_below_percent": 25
+                }
+            },
+            "pre":  {},
+            "post": {},
+    }
+}
 
 # Buff skills to auto-use when conditions are met.
 # Each entry: conditions (when to use), pre/post actions (equip swaps, etc.).
@@ -105,7 +120,11 @@ BUFF_SKILLS: dict[str, dict] = {
         "post": {"equip_item": "Elven Long Sword"},
     },
     "Frenzy": {
-        "conditions": {"hp_below_percent": 30},
+        "conditions": {
+            "use": {
+                "hp_below_percent": 30
+            }
+        },
         "pre":  {"equip_item": "Knife"},
         "post": {"equip_item": "Elven Long Sword"},
     },

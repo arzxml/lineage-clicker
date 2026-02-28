@@ -23,6 +23,7 @@ import time as _time
 from time import sleep
 from typing import Optional
 
+import cv2
 import numpy as np
 
 from bot.screen import ScreenCapture, TemplateMatcher
@@ -88,6 +89,8 @@ class ScenarioRunner:
         self.buff_skills_to_use: dict[str, dict] = config.BUFF_SKILLS
         self.combat_skills_to_use: dict[str, dict] = config.COMBAT_SKILLS
         self.toggle_skills_to_use: dict[str, dict] = config.TOGGLE_SKILLS
+        # Track which toggle skills are currently active (on)
+        self._toggle_active: dict[str, bool] = {name: False for name in config.TOGGLE_SKILLS}
 
         self._last_skill_check: float = 0.0             # throttle skill window opens
 
@@ -669,6 +672,8 @@ class ScenarioRunner:
         prev = {name: info.get("available") for name, info in self.skill_availability.items()}
         current: dict[str, bool] = {}
 
+        brightness_ratio = getattr(config, "SKILL_BRIGHTNESS_RATIO", 0.90)
+
         for skill_name in self.skill_availability:
             template_name = f"skill-{skill_name}"
             hit = matcher.find(
@@ -676,6 +681,30 @@ class ScenarioRunner:
                 template_name,
                 region=config.REGION_SKILL_HOT_BAR,
             )
+
+            # Even if shape matches, check brightness to detect cooldown
+            if hit is not None:
+                tpl_img = matcher.get_template(template_name)
+                if tpl_img is not None:
+                    cx, cy, conf = hit
+                    th, tw = tpl_img.shape[:2]
+                    # Extract matched region from full frame
+                    x1 = max(0, cx - tw // 2)
+                    y1 = max(0, cy - th // 2)
+                    x2 = min(frame.shape[1], x1 + tw)
+                    y2 = min(frame.shape[0], y1 + th)
+                    region_crop = frame[y1:y2, x1:x2]
+                    # Compare mean brightness (V channel in HSV)
+                    tpl_brightness = cv2.cvtColor(tpl_img, cv2.COLOR_BGR2GRAY).mean()
+                    region_brightness = cv2.cvtColor(region_crop, cv2.COLOR_BGR2GRAY).mean()
+                    b_ratio = region_brightness / tpl_brightness if tpl_brightness > 0 else 1.0
+                    if b_ratio < brightness_ratio:
+                        log.debug(
+                            f"[skill:check] {skill_name} = UNAVAILABLE "
+                            f"(darkened: brightness {b_ratio:.2f} < {brightness_ratio})"
+                        )
+                        hit = None  # reject — skill is on cooldown
+
             available = hit is not None
             current[skill_name] = available
             self.skill_availability[skill_name]["available"] = available
@@ -723,8 +752,9 @@ class ScenarioRunner:
 
             # 2. Evaluate conditions
             conditions = cfg.get("conditions", {})
-            if not self._check_buff_conditions(conditions):
-                log.debug(f"[buff:skip] {skill_name} – conditions not met ({conditions})")
+            use_conditions = conditions.get("use", conditions)  # support nested {"use": {...}} or flat
+            if not self._check_buff_conditions(use_conditions):
+                log.debug(f"[buff:skip] {skill_name} – conditions not met ({use_conditions})")
                 continue
 
             # 3. Execute pre-actions
@@ -769,31 +799,45 @@ class ScenarioRunner:
 
         Supported conditions:
           - hp_below_percent: int  –  True if HP% < value
+          - hp_above_percent: int  –  True if HP% > value
           - mp_below_percent: int  –  True if MP% < value
+          - mp_above_percent: int  –  True if MP% > value
           - cp_below_percent: int  –  True if CP% < value
+          - cp_above_percent: int  –  True if CP% > value
 
         Empty conditions dict → always True.
+        All specified conditions must be met (AND logic).
         """
         if not conditions:
             return True
 
+        hp_pct = (self.hp_current / self.hp_max * 100) if self.hp_max > 0 else 100
+        mp_pct = (self.mp_current / self.mp_max * 100) if self.mp_max > 0 else 100
+        cp_pct = (self.cp_current / self.cp_max * 100) if self.cp_max > 0 else 100
+
         hp_below = conditions.get("hp_below_percent")
-        if hp_below is not None:
-            hp_pct = (self.hp_current / self.hp_max * 100) if self.hp_max > 0 else 100
-            if hp_pct >= int(hp_below):
-                return False
+        if hp_below is not None and hp_pct >= int(hp_below):
+            return False
+
+        hp_above = conditions.get("hp_above_percent")
+        if hp_above is not None and hp_pct <= int(hp_above):
+            return False
 
         mp_below = conditions.get("mp_below_percent")
-        if mp_below is not None:
-            mp_pct = (self.mp_current / self.mp_max * 100) if self.mp_max > 0 else 100
-            if mp_pct >= int(mp_below):
-                return False
+        if mp_below is not None and mp_pct >= int(mp_below):
+            return False
+
+        mp_above = conditions.get("mp_above_percent")
+        if mp_above is not None and mp_pct <= int(mp_above):
+            return False
 
         cp_below = conditions.get("cp_below_percent")
-        if cp_below is not None:
-            cp_pct = (self.cp_current / self.cp_max * 100) if self.cp_max > 0 else 100
-            if cp_pct >= int(cp_below):
-                return False
+        if cp_below is not None and cp_pct >= int(cp_below):
+            return False
+
+        cp_above = conditions.get("cp_above_percent")
+        if cp_above is not None and cp_pct <= int(cp_above):
+            return False
 
         return True
 
@@ -843,14 +887,26 @@ class ScenarioRunner:
         if reading is None:
             return
 
-        # Use previous values as fallback for fields OCR didn't detect
+        # Use previous values as fallback for fields OCR didn't detect.
+        # Also reject readings where current > max – that's always an
+        # OCR mis-read (e.g. '/' read as '1' turning '92/440' into 921/440).
         level  = reading.level      if reading.level > 0      else self.char_level
-        cp_cur = reading.cp_current if reading.cp_max > 0     else self.cp_current
-        cp_max = reading.cp_max     if reading.cp_max > 0     else self.cp_max
-        hp_cur = reading.hp_current if reading.hp_max > 0     else self.hp_current
-        hp_max = reading.hp_max     if reading.hp_max > 0     else self.hp_max
-        mp_cur = reading.mp_current if reading.mp_max > 0     else self.mp_current
-        mp_max = reading.mp_max     if reading.mp_max > 0     else self.mp_max
+
+        if reading.cp_max > 0 and reading.cp_current <= reading.cp_max:
+            cp_cur, cp_max = reading.cp_current, reading.cp_max
+        else:
+            cp_cur, cp_max = self.cp_current, self.cp_max
+
+        if reading.hp_max > 0 and reading.hp_current <= reading.hp_max:
+            hp_cur, hp_max = reading.hp_current, reading.hp_max
+        else:
+            hp_cur, hp_max = self.hp_current, self.hp_max
+
+        if reading.mp_max > 0 and reading.mp_current <= reading.mp_max:
+            mp_cur, mp_max = reading.mp_current, reading.mp_max
+        else:
+            mp_cur, mp_max = self.mp_current, self.mp_max
+
         xp_pct = reading.xp_percent if reading.xp_percent > 0 else self.xp_percent
 
         # Check if anything changed
@@ -1000,6 +1056,73 @@ class ScenarioRunner:
     #  REGISTRY  –  name → method name
     # ─────────────────────────────────────────────────────────────────
 
+    async def manage_toggle_skills(
+        self,
+        frame: np.ndarray,
+        matcher: TemplateMatcher,
+        ih: InputHandler,
+        bus: EventBus,
+        event: Optional[dict] = None,
+    ) -> None:
+        """Toggle skills on/off based on conditions.
+
+        For each toggle skill:
+          - If conditions are met and skill is OFF → click it to turn ON.
+          - If conditions are NOT met and skill is ON → click it to turn OFF.
+        """
+        if not self.toggle_skills_to_use:
+            return
+        # Only manage toggles when we have stats (mp_max > 0)
+        if self.mp_max <= 0:
+            return
+
+        for skill_name, cfg in self.toggle_skills_to_use.items():
+            conditions = cfg.get("conditions", {})
+            enable_conditions = conditions.get("enable", {})
+            disable_conditions = conditions.get("disable", {})
+            is_active = self._toggle_active.get(skill_name, False)
+
+            log.debug(
+                f"[toggle:eval] {skill_name} active={is_active} "
+                f"enable_cond={enable_conditions} disable_cond={disable_conditions}"
+            )
+
+            if not is_active and enable_conditions:
+                # Check if we should turn ON
+                should_enable = self._check_buff_conditions(enable_conditions)
+                if should_enable:
+                    template_name = f"skill-{skill_name}"
+                    fresh = self.capture.grab()
+                    hit = matcher.find(
+                        fresh, template_name,
+                        region=config.REGION_SKILL_HOT_BAR,
+                    )
+                    if hit:
+                        log.info(f"[toggle:on] enabling {skill_name} (conf={hit[2]:.2f})")
+                        ih.click(hit[0], hit[1])
+                        self._toggle_active[skill_name] = True
+                        sleep(0.3)
+                    else:
+                        log.debug(f"[toggle:on] {skill_name} template not found on hotbar")
+
+            elif is_active and disable_conditions:
+                # Check if we should turn OFF
+                should_disable = self._check_buff_conditions(disable_conditions)
+                if should_disable:
+                    template_name = f"skill-{skill_name}"
+                    fresh = self.capture.grab()
+                    hit = matcher.find(
+                        fresh, template_name,
+                        region=config.REGION_SKILL_HOT_BAR,
+                    )
+                    if hit:
+                        log.info(f"[toggle:off] disabling {skill_name} (conf={hit[2]:.2f})")
+                        ih.click(hit[0], hit[1])
+                        self._toggle_active[skill_name] = False
+                        sleep(0.3)
+                    else:
+                        log.debug(f"[toggle:off] {skill_name} template not found on hotbar")
+
     def get_scenarios(self, names: list[str]) -> list:
         """Return a list of bound methods for the given scenario names."""
         registry = {
@@ -1017,6 +1140,7 @@ class ScenarioRunner:
             "read_character_stats": self.read_character_stats,
             "check_skill_availability": self.check_skill_availability,
             "use_buff_skills": self.use_buff_skills,
+            "manage_toggle_skills": self.manage_toggle_skills,
             "move_to_mobs": self.move_to_mobs,
             "calibrate_camera": self.calibrate_camera,
             "stop_if_exit_game": self.stop_if_exit_game,

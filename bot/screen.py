@@ -114,6 +114,10 @@ class TemplateMatcher:
             return cx, cy, float(max_val)
         return None
 
+    def get_template(self, template_name: str) -> Optional[np.ndarray]:
+        """Return the raw template image (BGR) by name, or None."""
+        return self._templates.get(template_name)
+
     def find_all(
         self,
         frame: np.ndarray,
