@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
+import ctypes.wintypes
 import logging
 import threading
 import time
-
-import mss
 
 import config
 from bot.screen import ScreenCapture, TemplateMatcher
@@ -28,6 +28,7 @@ from bot.network.event_bus import EventBus
 from bot.network.server import NetworkServer
 from bot.network.client import NetworkClient
 from bot.scenarios import ScenarioRunner, BotStopRequested
+from bot.network.remote_state import RemoteStateStore
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -101,19 +102,41 @@ async def bot_loop(
     bus: EventBus,
     network_sender,           # NetworkServer | NetworkClient
 ) -> None:
-    capture = ScreenCapture()
     matcher = TemplateMatcher()
     ih = InputHandler()
-    scenarios = ScenarioRunner()
+    remote_state = RemoteStateStore()
+    scenarios = ScenarioRunner(remote_state=remote_state)
+    capture = scenarios.capture
 
     # Focus the game window by clicking center of the game monitor
-    with mss.mss() as sct:
-        mon = sct.monitors[config.MONITOR_INDEX]
-        cx = mon["left"] + mon["width"] // 2
-        cy = mon["top"] + mon["height"] // 2
+    mon = capture.monitor
+    cx = mon["left"] + mon["width"] // 2
+    cy = mon["top"] + mon["height"] // 2
     log.info(f"[bot] clicking game monitor center ({cx}, {cy}) to focus")
     ih.click(cx, cy)
     await asyncio.sleep(0.3)
+
+    # ── Quick input-health check ──────────────────────────────────
+    # Move the cursor to a known spot, then read it back via Win32.
+    _pt = ctypes.wintypes.POINT()
+    test_x, test_y = cx + 50, cy + 50
+    ih.move_to(test_x, test_y)
+    time.sleep(0.05)
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(_pt))
+    drift = abs(_pt.x - test_x) + abs(_pt.y - test_y)
+    if drift > 10:
+        log.warning(
+            f"[bot:input-check] CURSOR MISMATCH – expected ({test_x},{test_y}), "
+            f"got ({_pt.x},{_pt.y}), drift={drift}px.  "
+            f"Interception driver may not be working!"
+        )
+    else:
+        log.info(
+            f"[bot:input-check] cursor OK ({_pt.x},{_pt.y}), drift={drift}px"
+        )
+    # Move back to center
+    ih.move_to(cx, cy)
+    await asyncio.sleep(0.1)
 
     # One-time camera setup
     scenarios.initialize(ih)

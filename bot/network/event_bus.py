@@ -15,6 +15,8 @@ import asyncio
 from collections import defaultdict
 from typing import Callable, Awaitable
 
+import config
+
 Handler = Callable[[dict], Awaitable[None]]
 
 
@@ -30,7 +32,14 @@ class EventBus:
         self._listeners[event_type].append(handler)
 
     async def publish(self, event: dict) -> None:
-        """Dispatch locally and push onto the queue."""
+        """Dispatch locally and push onto the queue.
+
+        Automatically stamps ``"from"`` with the local character name
+        on events that originate here (i.e. not already tagged by a
+        remote sender).
+        """
+        if "from" not in event and event.get("_from") != "remote":
+            event["from"] = config.CHARACTER_NAME
         await self._queue.put(event)
         handlers = self._listeners.get(event.get("type", ""), [])
         for h in handlers:
