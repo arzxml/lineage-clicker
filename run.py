@@ -57,6 +57,9 @@ async def bot_loop(
     ih.click(cx, cy)
     await asyncio.sleep(0.3)
 
+    # One-time camera setup
+    scenarios.initialize(ih)
+
     active_scenarios = scenarios.get_scenarios(config.ACTIVE_SCENARIOS)
 
     interval = 1.0 / max(config.CAPTURE_FPS, 1)

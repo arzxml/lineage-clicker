@@ -43,8 +43,10 @@ class ScenarioRunner:
 
     def __init__(self) -> None:
         self.busy = False
-        self._last_top_down: float = 0.0       # monotonic timestamp
-        self._top_down_interval: float = 15.0   # seconds between camera resets
+        self._initialized = False
+        self._pre_oriented = False              # set by pre_orient_to_next_mob
+        self._last_patrol_check: float = 0.0    # monotonic timestamp
+        self._returning_to_zone = False         # currently heading back
 
     # ─────────────────────────────────────────────────────────────────
     #  SCENARIOS
@@ -52,6 +54,12 @@ class ScenarioRunner:
     def _cancel_target(self, ih: InputHandler) -> None:
         """Cancel current target by pressing Escape."""
         ih.press("esc")
+
+    def initialize(self, ih: InputHandler) -> None:
+        """One-time setup: reset camera to top-down view."""
+        if not self._initialized:
+            log.info("[init] setting initial top-down camera view")
+            self._initialized = True
 
     # ── Target HP helpers (colour-based, transparency-proof) ──────
 
@@ -61,8 +69,8 @@ class ScenarioRunner:
         return matcher.find(frame, "has_target", region=config.REGION_TARGET) is not None
 
     @staticmethod
-    def _target_has_hp(frame: np.ndarray) -> bool:
-        """Return True if the target's HP bar has any red/crimson fill.
+    def _target_hp_ratio(frame: np.ndarray) -> float:
+        """Return the red fill ratio (0.0–1.0) of the target HP bar.
 
         Works by counting reddish pixels in the thin HP-bar strip.
         Immune to background transparency changes because we look for
@@ -85,7 +93,7 @@ class ScenarioRunner:
 
         red_pixels = np.count_nonzero(mask)
         total = mask.size
-        ratio = red_pixels / total if total else 0
+        ratio = red_pixels / total if total else 0.0
         log.debug(f"[hp_bar] red fill ratio: {ratio:.3f} ({red_pixels}/{total})")
 
         # ── DEBUG: save roi + mask once per session for tuning ──
@@ -93,7 +101,6 @@ class ScenarioRunner:
             ScenarioRunner._hp_debug_saved = True
             cv2.imwrite("debug_hp_roi.png", roi)
             cv2.imwrite("debug_hp_mask.png", mask)
-            # Also log the HSV stats for the region
             h, s, v = cv2.split(hsv)
             log.debug(
                 f"[hp_bar DEBUG] H min={h.min()} max={h.max()} "
@@ -101,33 +108,114 @@ class ScenarioRunner:
                 f"V min={v.min()} max={v.max()}"
             )
 
-        return ratio > 0.01          # >1 % red → HP still visible
+        return ratio
+
+    @staticmethod
+    def _target_has_hp(frame: np.ndarray) -> bool:
+        """Return True if the target's HP bar has any red fill (>1%)."""
+        return ScenarioRunner._target_hp_ratio(frame) > 0.01
 
     @staticmethod
     def _target_is_dead(frame: np.ndarray, matcher: TemplateMatcher) -> bool:
         """Target is visible but its HP bar is empty → dead."""
         return ScenarioRunner._has_target(frame, matcher) and not ScenarioRunner._target_has_hp(frame)
 
-    def _set_top_down_view(self, ih: InputHandler) -> None:
-        """Reset camera pitch to top-down."""
-        with mss.mss() as sct:
-            mon = sct.monitors[config.MONITOR_INDEX]
-        cx = mon["left"] + mon["width"] // 2
-        cy = mon["top"] + mon["height"] // 2
-        # Drag DOWN hard to guarantee hitting the top-down limit
-        ih.drag_to(cx, cy, cx, cy + 600, duration=0.8, button="right")
-        sleep(0.2)
+    # def _set_top_down_view(self, ih: InputHandler) -> None:
+    #     """Reset camera pitch to top-down."""
+    #     with mss.mss() as sct:
+    #         mon = sct.monitors[config.MONITOR_INDEX]
+    #     cx = mon["left"] + mon["width"] // 2
+    #     cy = mon["top"] + mon["height"] // 2
+    #     # Drag DOWN hard to guarantee hitting the top-down limit
+    #     ih.drag_to(cx, cy, cx, cy + 600, duration=0.8, button="right")
+    #     sleep(0.2)
 
-    def _set_angled_view(self, ih: InputHandler) -> None:
-        """From top-down, tilt slightly to get a playable angled view."""
+    # def _set_angled_view(self, ih: InputHandler) -> None:
+    #     """From top-down, tilt slightly to get a playable angled view."""
+    #     with mss.mss() as sct:
+    #         mon = sct.monitors[config.MONITOR_INDEX]
+    #     cx = mon["left"] + mon["width"] // 2
+    #     cy = mon["top"] + mon["height"] // 2
+    #     # Drag UP slightly — from ground/top-down toward angled
+    #     tilt = getattr(config, "CAMERA_TILT_UP_PX", 40)
+    #     ih.drag_to(cx, cy, cx, cy - tilt, duration=0.4, button="right")
+    #     sleep(0.15)
+
+    # ── Patrol-zone helpers ────────────────────────────────────────
+
+    def _check_patrol_zone(
+        self, ih: InputHandler, matcher: TemplateMatcher,
+    ) -> Optional[tuple[float, float, float]]:
+        """Open the map, find the patrol_zone template, return offset.
+
+        Returns (dx, dy, dist) where dx/dy are pixel offsets of the
+        patrol zone template centre relative to the map centre
+        (positive dx = patrol zone is to the right = player is left of it),
+        and *dist* is the Euclidean pixel distance.  None if template
+        not found.
+        """
+        capture = ScreenCapture()
+
+        # Open map
+        ih.hotkey("alt", "m")
+        sleep(0.6)
+
+        frame = capture.grab()
+        rx, ry, rw, rh = config.REGION_MAP
+        hit = matcher.find(frame, "patrol_zone", region=config.REGION_MAP)
+
+        # Close map immediately
+        ih.hotkey("alt", "m")
+        sleep(0.3)
+
+        if hit is None:
+            log.debug("[patrol] patrol_zone template not found on map")
+            return None
+
+        px, py, conf = hit
+        # Map centre in screen coords
+        map_cx = rx + rw // 2
+        map_cy = ry + rh // 2
+        dx = px - map_cx
+        dy = py - map_cy
+        dist = math.hypot(dx, dy)
+        log.debug(
+            f"[patrol] zone offset dx={dx:.0f} dy={dy:.0f} "
+            f"dist={dist:.0f}px  conf={conf:.2f}"
+        )
+        return dx, dy, dist
+
+    def _walk_in_direction(
+        self, ih: InputHandler, angle_rad: float, steps: int = 15,
+    ) -> None:
+        """Click-walk in *angle_rad* direction (0 = north, + = CW).
+
+        Uses screen-centre + offset to produce directional clicks.
+        """
+        walk_radius = getattr(config, "MOVE_FORWARD_CLICK_PX", 250)
+        capture = ScreenCapture()
+
         with mss.mss() as sct:
             mon = sct.monitors[config.MONITOR_INDEX]
-        cx = mon["left"] + mon["width"] // 2
-        cy = mon["top"] + mon["height"] // 2
-        # Drag UP slightly — from ground/top-down toward angled
-        tilt = getattr(config, "CAMERA_TILT_UP_PX", 40)
-        ih.drag_to(cx, cy, cx, cy - tilt, duration=0.4, button="right")
-        sleep(0.15)
+        scr_cx = mon["left"] + mon["width"] // 2
+        scr_cy = mon["top"] + mon["height"] // 2
+
+        # angle_rad: 0=north (+screen-up), positive=clockwise
+        click_x = scr_cx + int(walk_radius * math.sin(angle_rad))
+        click_y = scr_cy - int(walk_radius * math.cos(angle_rad))
+
+        close_range = getattr(config, "MOB_CLOSE_RANGE", 0.15)
+        for i in range(steps):
+            ih.click(click_x, click_y)
+            sleep(0.45)
+            # If a mob appears nearby while returning, stop early
+            frame = capture.grab()
+            result = self._find_nearest_mob_on_minimap(frame)
+            if result is not None and result[2] <= close_range:
+                log.debug("[patrol] mob appeared nearby, stopping walk-back")
+                break
+            if i % 5 == 4:
+                log.debug(f"[patrol] walking back… step {i+1}/{steps}")
 
     def _rotate_camera_toward_mob(
         self, ih: InputHandler, mob_dist: Optional[float] = None,
@@ -231,6 +319,7 @@ class ScenarioRunner:
         self,
         frame: np.ndarray,
         target_dist: Optional[float] = None,
+        min_dist: Optional[float] = None,
     ) -> Optional[tuple[float, float, float]]:
         """
         Detect red dots (mobs) on the minimap and return
@@ -292,6 +381,10 @@ class ScenarioRunner:
             norm_dy = cdy / radius
             norm_dist = math.hypot(norm_dx, norm_dy)
 
+            # Skip mobs closer than min_dist (e.g. the one we're fighting)
+            if min_dist is not None and norm_dist < min_dist:
+                continue
+
             if target_dist is not None:
                 # Pick mob whose distance from centre best matches target
                 score = abs(norm_dist - target_dist)
@@ -308,13 +401,6 @@ class ScenarioRunner:
             return None
         return best_dx, best_dy, best_norm_dist
 
-    def _ensure_top_down(self, ih: InputHandler) -> None:
-        """Reset camera to top-down if enough time has elapsed."""
-        now = _time.monotonic()
-        if now - self._last_top_down >= self._top_down_interval:
-            log.debug("[camera] resetting top-down view")
-            self._set_top_down_view(ih)
-            self._last_top_down = now
 
     def _move_to_closest_mob(self, ih: InputHandler) -> None:
         """
@@ -340,29 +426,27 @@ class ScenarioRunner:
         walk_y = scr_cy - forward_px
 
         # ── Phase 1: orient ─────────────────────────────────────
-        self._set_top_down_view(ih)
-        frame = capture.grab()
+        if self._pre_oriented:
+            log.debug("[move] pre-oriented – skipping orient phase")
+            self._pre_oriented = False
 
-        result = self._find_nearest_mob_on_minimap(frame)
-        if result is None:
-            log.debug("[move] no mobs on minimap")
-            return
+            frame = capture.grab()
+            result = self._find_nearest_mob_on_minimap(frame)
+            if result is None:
+                log.debug("[move] no mobs on minimap")
+                return
 
-        dx, dy, dist = result
-        if dist <= close_range:
-            log.debug("[move] mob already in range")
-            return
+            dx, dy, dist = result
+            if dist <= close_range:
+                log.debug("[move] mob already in range")
+                return
 
-        log.debug(f"[move] mob dir=({dx:.2f},{dy:.2f}) dist={dist:.2f}")
+            log.debug(f"[move] mob dir=({dx:.2f},{dy:.2f}) dist={dist:.2f}")
 
-        # Rotate camera until mob is directly north
-        if not self._rotate_camera_toward_mob(ih, mob_dist=dist):
-            log.debug("[move] lost mob while rotating, aborting")
-            return
-
-        # ── Phase 2: walk ───────────────────────────────────────
-        # Tilt from top-down to playable angled view (once)
-        self._set_angled_view(ih)
+            # Rotate camera until mob is directly north
+            if not self._rotate_camera_toward_mob(ih, mob_dist=dist):
+                log.debug("[move] lost mob while rotating, aborting")
+                return
 
         max_clicks = 40
         for i in range(max_clicks):
@@ -439,7 +523,6 @@ class ScenarioRunner:
         has_target = self._has_target(frame, matcher)
         is_dead = self._target_is_dead(frame, matcher)
 
-        log.debug(f"has_target: {has_target}, is_target_dead: {is_dead}")
         if has_target and is_dead:
             self.busy = True
             log.debug("[loot_on_dead_target] target is dead – looting")
@@ -450,6 +533,190 @@ class ScenarioRunner:
             finally:
                 self._cancel_target(ih)
                 self.busy = False
+
+    async def pre_orient_to_next_mob(
+        self,
+        frame: np.ndarray,
+        matcher: TemplateMatcher,
+        ih: InputHandler,
+        bus: EventBus,
+        event: Optional[dict] = None,
+    ) -> None:
+        """While fighting, if target HP is low, pre-orient toward next mob.
+
+        Saves several seconds between kills by doing the top-down →
+        minimap-read → rotate sequence *before* the current target dies.
+        """
+        if self.busy:
+            return
+        if self._pre_oriented:
+            return
+        if not self._has_target(frame, matcher):
+            return
+
+        ratio = self._target_hp_ratio(frame)
+        threshold = getattr(config, "PRE_ORIENT_HP_THRESHOLD", 0.10)
+        if ratio > threshold or ratio <= 0.01:
+            # HP not low enough, or target already dead
+            return
+
+        self.busy = True
+        try:
+            log.debug(
+                f"[pre_orient] target HP low ({ratio:.3f}), "
+                f"pre-orienting toward next mob"
+            )
+            # No top-down reset here — minimap works at any pitch
+            # and _rotate_camera_toward_mob only drags horizontally.
+            capture = ScreenCapture()
+            frame = capture.grab()
+            # Look for mobs beyond close range (skip the one we're fighting)
+            close_range = getattr(config, "MOB_CLOSE_RANGE", 0.15)
+            result = self._find_nearest_mob_on_minimap(
+                frame, min_dist=close_range,
+            )
+            if result is None:
+                log.debug("[pre_orient] no next mob found on minimap")
+                return
+
+            dx, dy, dist = result
+            log.debug(
+                f"[pre_orient] next mob dir=({dx:.2f},{dy:.2f}) "
+                f"dist={dist:.2f}"
+            )
+
+            if self._rotate_camera_toward_mob(ih, mob_dist=dist):
+                self._pre_oriented = True
+                log.debug("[pre_orient] camera pre-oriented successfully")
+            else:
+                log.debug("[pre_orient] lost next mob while rotating")
+        finally:
+            self.busy = False
+
+    async def return_to_patrol_zone(
+        self,
+        frame: np.ndarray,
+        matcher: TemplateMatcher,
+        ih: InputHandler,
+        bus: EventBus,
+        event: Optional[dict] = None,
+    ) -> None:
+        """Periodically check the map; if outside patrol zone, walk back.
+
+        The map auto-centres on the player, so the offset of the
+        patrol_zone template from the map centre tells us how far
+        (and in which direction) the player has drifted.
+        """
+        if self.busy:
+            return
+        # Don't check while we have a live target
+        if self._has_target(frame, matcher):
+            return
+
+        interval = getattr(config, "PATROL_CHECK_INTERVAL", 30.0)
+        now = _time.monotonic()
+        if now - self._last_patrol_check < interval:
+            return
+
+        self.busy = True
+        try:
+            self._last_patrol_check = now
+            result = self._check_patrol_zone(ih, matcher)
+            if result is None:
+                log.debug("[patrol] could not locate zone – skipping")
+                return
+
+            dx, dy, dist = result
+            threshold = getattr(config, "PATROL_MAX_DRIFT_PX", 60)
+            if dist <= threshold:
+                log.debug(f"[patrol] inside zone (drift={dist:.0f}px)")
+                self._returning_to_zone = False
+                return
+
+            log.info(
+                f"[patrol] outside zone (drift={dist:.0f}px > {threshold}px) "
+                f"– walking back"
+            )
+            self._returning_to_zone = True
+
+            # Direction from player toward the patrol zone.
+            # On the map: +dx = zone is right of player, +dy = zone is below.
+            # Map axes: right = east, down = south.
+            # Camera north on minimap corresponds to screen-up.
+            # We need to rotate camera so that walking "forward" (north on
+            # minimap / up on screen) takes us toward the zone.
+            # Target angle in map-space: atan2(dx, -dy)  (0 = north, + = CW)
+            target_angle = math.atan2(dx, -dy)
+            log.debug(
+                f"[patrol] need to face {math.degrees(target_angle):.1f}° "
+                f"to reach zone"
+            )
+
+            # Use self-calibrating rotation via a virtual "mob" at that angle
+            # on the minimap.  We place a synthetic reading and rotate toward it.
+            # Simplest approach: just rotate camera by target_angle using
+            # the same calibration technique.
+            self._rotate_camera_by_angle(ih, target_angle)
+
+            # Walk forward toward the zone
+            steps = getattr(config, "PATROL_RETURN_STEPS", 15)
+            self._walk_in_direction(ih, 0.0, steps=steps)  # 0 = straight ahead
+
+        finally:
+            self.busy = False
+
+    def _rotate_camera_by_angle(
+        self, ih: InputHandler, target_angle: float,
+    ) -> None:
+        """Rotate camera by *target_angle* radians using self-calibration.
+
+        Uses a small test drag to measure px-per-radian, then applies
+        the full rotation.  Works without needing a mob on the minimap.
+        """
+        if abs(target_angle) < 0.12:  # < ~7°, not worth rotating
+            return
+
+        test_px = 25
+        with mss.mss() as sct:
+            mon = sct.monitors[config.MONITOR_INDEX]
+        cx = mon["left"] + mon["width"] // 2
+        cy = mon["top"] + mon["height"] // 2
+
+        capture = ScreenCapture()
+
+        # ── Read 1: pick any mob (or just a reference point) ──
+        frame1 = capture.grab()
+        r1 = self._find_nearest_mob_on_minimap(frame1)
+
+        # Test drag right
+        ih.drag_to(cx, cy, cx + test_px, cy, duration=0.15, button="right")
+        sleep(0.35)
+
+        frame2 = capture.grab()
+        r2 = self._find_nearest_mob_on_minimap(frame2)
+
+        if r1 is not None and r2 is not None:
+            a1 = math.atan2(r1[0], -r1[1])
+            a2 = math.atan2(r2[0], -r2[1])
+            delta = (a2 - a1 + math.pi) % (2 * math.pi) - math.pi
+            if abs(delta) > 0.02:
+                px_per_rad = test_px / delta
+                correction = int(target_angle * px_per_rad)
+                correction = max(-500, min(500, correction))
+                log.debug(
+                    f"[patrol_rotate] calibrated px/rad={px_per_rad:.1f}, "
+                    f"correction={correction}px"
+                )
+                ih.drag_to(cx, cy, cx + correction, cy, duration=0.3, button="right")
+                sleep(0.3)
+                return
+
+        # Fallback: rough estimate (~100px per 90°)
+        rough_px = int(target_angle / (math.pi / 2) * 100)
+        rough_px = max(-400, min(400, rough_px))
+        log.debug(f"[patrol_rotate] fallback drag {rough_px}px")
+        ih.drag_to(cx, cy, cx + rough_px, cy, duration=0.3, button="right")
+        sleep(0.3)
 
     async def auto_attack(
         self,
@@ -521,6 +788,8 @@ class ScenarioRunner:
             "react_to_remote_loot": self.react_to_remote_loot,
             "assist_ppl_then_attack_on_dead_or_non_existing_target": self.assist_ppl_then_attack_on_dead_or_non_existing_target,
             "loot_on_dead_target": self.loot_on_dead_target,
+            "pre_orient_to_next_mob": self.pre_orient_to_next_mob,
+            "return_to_patrol_zone": self.return_to_patrol_zone,
             "move_to_mobs_and_attack_if_no_target": self.move_to_mobs_and_attack_if_no_target,
             "stop_if_exit_game": self.stop_if_exit_game,
         }
