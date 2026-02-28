@@ -27,8 +27,8 @@ ACTIVE_SCENARIOS: list[str] = [
     "loot_on_dead_target",
     "pre_orient_to_next_mob",
     "return_to_patrol_zone",
-    "move_to_mobs_and_attack_if_no_target",
-    # "move_to_mobs",  # now a static method, call directly: ScenarioRunner.move_to_mobs(ih)
+    "attack_mob_in_range",
+    "move_to_mobs",
     # "assist_ppl_then_attack_on_dead_or_non_existing_target",
     # "auto_attack",
     # "loot_nearby",
@@ -57,6 +57,10 @@ KEY_NEXT_TARGET = "f10"
 MOVE_CLICK_RADIUS = 700   # how far (px) from screen center to click when walking (directional)
 MOVE_FORWARD_CLICK_PX = 250  # how far above screen center to click when walking forward
 MOB_CLOSE_RANGE   = 0.1  # normalised minimap distance (0–1) at which mob is "close enough"
+MOB_MELEE_RANGE   = 0.03  # mob this close is likely attacking us — fight before looting
+
+# Cooldown
+LOOT_COOLDOWN     = 1.0   # seconds to wait after looting before moving on
 
 # Camera
 CAMERA_TILT_UP_PX    = 5    # px to drag up from top-down (small! too much = sky)

@@ -2,7 +2,7 @@
 bot/scenarios.py – game logic / scenario definitions
 
 Scenarios are methods on the ScenarioRunner class, which holds
-shared state (e.g. busy flag) without globals.
+shared state (e.g. BotState enum) without globals.
 
 Each scenario method receives:
     frame         – current screen as a BGR numpy array
@@ -16,6 +16,7 @@ Add your own scenarios below and register them in SCENARIO_REGISTRY.
 
 from __future__ import annotations
 
+import enum
 import logging
 import math
 import time as _time
@@ -34,6 +35,17 @@ import config
 log = logging.getLogger(__name__)
 
 
+class BotState(enum.Enum):
+    """Granular activity states for the bot."""
+    IDLE = "idle"
+    MOVING = "moving"               # walking toward a mob
+    IN_RANGE = "in_range"           # mob nearby, ready for attack_mob_in_range
+    LOOTING = "looting"             # picking up drops
+    ATTACKING_NEARBY = "attacking"  # fighting a nearby mob (deferred loot)
+    PRE_ORIENTING = "pre_orienting" # camera pre-rotation
+    PATROLLING = "patrolling"       # returning to patrol zone
+
+
 class BotStopRequested(Exception):
     """Raised by a scenario to signal the bot loop should exit."""
 
@@ -42,11 +54,27 @@ class ScenarioRunner:
     """Holds all scenarios as methods with shared instance state."""
 
     def __init__(self) -> None:
-        self.busy = False
+        self._state = BotState.IDLE
         self._initialized = False
         self._pre_oriented = False              # set by pre_orient_to_next_mob
         self._last_patrol_check: float = 0.0    # monotonic timestamp
         self._returning_to_zone = False         # currently heading back
+        self._pending_loot = False              # loot deferred (fighting nearby mob)
+        self._loot_done_at: float = 0.0         # when looting last finished
+
+    # ── State helpers ─────────────────────────────────────────────
+
+    @property
+    def is_idle(self) -> bool:
+        return self._state == BotState.IDLE
+
+    def _set_state(self, state: BotState) -> None:
+        log.debug(f"[state] {self._state.value} -> {state.value}")
+        self._state = state
+
+    def _clear_state(self) -> None:
+        log.debug(f"[state] {self._state.value} -> idle")
+        self._state = BotState.IDLE
 
     # ─────────────────────────────────────────────────────────────────
     #  SCENARIOS
@@ -117,8 +145,22 @@ class ScenarioRunner:
 
     @staticmethod
     def _target_is_dead(frame: np.ndarray, matcher: TemplateMatcher) -> bool:
-        """Target is visible but its HP bar is empty → dead."""
-        return ScenarioRunner._has_target(frame, matcher) and not ScenarioRunner._target_has_hp(frame)
+        """Target is visible but its HP bar is empty -> dead.
+
+        Uses a confirmation re-check to avoid declaring a mob dead
+        when just a sliver of HP remains.
+        """
+        if not ScenarioRunner._has_target(frame, matcher):
+            return False
+        if ScenarioRunner._target_has_hp(frame):
+            return False
+        # First check says dead — wait briefly and confirm
+        sleep(0.3)
+        capture = ScreenCapture()
+        frame2 = capture.grab()
+        if not ScenarioRunner._has_target(frame2, matcher):
+            return False  # target disappeared entirely, not dead
+        return not ScenarioRunner._target_has_hp(frame2)
 
     # def _set_top_down_view(self, ih: InputHandler) -> None:
     #     """Reset camera pitch to top-down."""
@@ -468,7 +510,7 @@ class ScenarioRunner:
             if i % 10 == 9:
                 log.debug(f"[move] still walking… dist={dist:.2f}")
 
-    async def move_to_mobs_and_attack_if_no_target(
+    async def attack_mob_in_range(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -476,18 +518,74 @@ class ScenarioRunner:
         bus: EventBus,
         event: Optional[dict] = None,
     ) -> None:
-        if self.busy:
+        """Try to target and attack the nearest mob.
+
+        Activates when IDLE (speculative attempt) or IN_RANGE
+        (after *move_to_mobs* walked us close).  Presses next-target
+        and attack keys.  Works in synergy with *move_to_mobs*.
+        """
+        if self._state not in (BotState.IDLE, BotState.IN_RANGE):
             return
-        if not self._has_target(frame, matcher):
-            self.busy = True
-            try:
-                log.debug("[move_to_mobs_and_attack_if_no_target] no target – looking for mobs")
-                self._move_to_closest_mob(ih)
+        if self._pending_loot:
+            return
+        loot_cooldown = getattr(config, "LOOT_COOLDOWN", 1.0)
+        if _time.monotonic() - self._loot_done_at < loot_cooldown:
+            return
+
+        has_target = self._has_target(frame, matcher)
+        came_from_move = self._state == BotState.IN_RANGE
+
+        # IDLE: only act when there's no target yet
+        if not came_from_move and has_target:
+            return
+
+        self._set_state(BotState.ATTACKING_NEARBY)
+        try:
+            if has_target:
+                # Already targeted (e.g. auto-targeted while walking) — just attack
+                log.debug("[attack_mob_in_range] target exists – pressing attack")
+                ih.press(config.KEY_ATTACK)
+            else:
+                log.debug("[attack_mob_in_range] no target – attempting to acquire")
                 ih.press(config.KEY_NEXT_TARGET)
                 sleep(0.2)
                 ih.press(config.KEY_ATTACK)
-            finally:
-                self.busy = False
+        finally:
+            self._clear_state()
+
+    async def move_to_mobs(
+        self,
+        frame: np.ndarray,
+        matcher: TemplateMatcher,
+        ih: InputHandler,
+        bus: EventBus,
+        event: Optional[dict] = None,
+    ) -> None:
+        """Orient the camera and walk toward the nearest mob.
+
+        Only activates when IDLE (after *attack_mob_in_range* failed
+        to acquire a target).  After walking close enough, transitions
+        to IN_RANGE so *attack_mob_in_range* picks it up next tick.
+        """
+        if not self.is_idle:
+            return
+        if self._pending_loot:
+            return
+        loot_cooldown = getattr(config, "LOOT_COOLDOWN", 1.0)
+        if _time.monotonic() - self._loot_done_at < loot_cooldown:
+            return
+        if self._has_target(frame, matcher):
+            return
+
+        self._set_state(BotState.MOVING)
+        try:
+            log.debug("[move_to_mobs] no target – walking toward nearest mob")
+            self._move_to_closest_mob(ih)
+            # Signal attack_mob_in_range to pick up the nearby mob
+            self._set_state(BotState.IN_RANGE)
+        except Exception:
+            self._clear_state()
+            raise
 
     async def assist_ppl_then_attack_on_dead_or_non_existing_target(
         self,
@@ -497,18 +595,18 @@ class ScenarioRunner:
         bus: EventBus,
         event: Optional[dict] = None,
     ) -> None:
-        if self.busy:
+        if not self.is_idle:
             return
 
         if not self._has_target(frame, matcher) or self._target_is_dead(frame, matcher):
-            self.busy = True
+            self._set_state(BotState.ATTACKING_NEARBY)
             try:
                 log.debug("[assist_ppl] no target – assisting ppl")
                 ih.press(config.KEY_TARGET_PPL)
                 ih.press(config.KEY_ASSIST)
                 ih.press(config.KEY_ATTACK)
             finally:
-                self.busy = False
+                self._clear_state()
 
     async def loot_on_dead_target(
         self,
@@ -518,21 +616,54 @@ class ScenarioRunner:
         bus: EventBus,
         event: Optional[dict] = None,
     ) -> None:
-        if self.busy:
+        if not self.is_idle:
             return
         has_target = self._has_target(frame, matcher)
         is_dead = self._target_is_dead(frame, matcher)
 
         if has_target and is_dead:
-            self.busy = True
-            log.debug("[loot_on_dead_target] target is dead – looting")
+            self._set_state(BotState.LOOTING)
             try:
-                for _ in range(5):
-                    ih.press(config.KEY_LOOT)
-                    sleep(0.1)
+                # Check if another mob is very close (likely attacking us)
+                melee_range = getattr(config, "MOB_MELEE_RANGE", 0.08)
+                result = self._find_nearest_mob_on_minimap(frame)
+                if result is not None and result[2] <= melee_range:
+                    log.debug(
+                        f"[loot] mob very close (dist={result[2]:.2f}), "
+                        f"fighting it first, deferring loot"
+                    )
+                    self._pending_loot = True
+                    self._cancel_target(ih)
+                    sleep(0.15)
+                    ih.press(config.KEY_NEXT_TARGET)
+                    sleep(0.2)
+                    ih.press(config.KEY_ATTACK)
+                    return
+
+                # No nearby threat — loot now
+                log.debug("[loot_on_dead_target] target is dead – looting")
+                self._do_loot(ih)
             finally:
-                self._cancel_target(ih)
-                self.busy = False
+                self._clear_state()
+
+        # Handle deferred loot: no target left (nearby mob also dead)
+        elif self._pending_loot and not has_target:
+            self._set_state(BotState.LOOTING)
+            try:
+                log.debug("[loot] picking up deferred loot")
+                self._do_loot(ih)
+                self._pending_loot = False
+            finally:
+                self._clear_state()
+
+    def _do_loot(self, ih: InputHandler) -> None:
+        """Press loot key several times then cancel target."""
+        for _ in range(8):
+            ih.press(config.KEY_LOOT)
+            sleep(0.1)
+        self._cancel_target(ih)
+        sleep(0.2)
+        self._loot_done_at = _time.monotonic()
 
     async def pre_orient_to_next_mob(
         self,
@@ -547,7 +678,7 @@ class ScenarioRunner:
         Saves several seconds between kills by doing the top-down →
         minimap-read → rotate sequence *before* the current target dies.
         """
-        if self.busy:
+        if not self.is_idle:
             return
         if self._pre_oriented:
             return
@@ -560,7 +691,7 @@ class ScenarioRunner:
             # HP not low enough, or target already dead
             return
 
-        self.busy = True
+        self._set_state(BotState.PRE_ORIENTING)
         try:
             log.debug(
                 f"[pre_orient] target HP low ({ratio:.3f}), "
@@ -591,7 +722,7 @@ class ScenarioRunner:
             else:
                 log.debug("[pre_orient] lost next mob while rotating")
         finally:
-            self.busy = False
+            self._clear_state()
 
     async def return_to_patrol_zone(
         self,
@@ -607,7 +738,7 @@ class ScenarioRunner:
         patrol_zone template from the map centre tells us how far
         (and in which direction) the player has drifted.
         """
-        if self.busy:
+        if not self.is_idle:
             return
         # Don't check while we have a live target
         if self._has_target(frame, matcher):
@@ -618,7 +749,7 @@ class ScenarioRunner:
         if now - self._last_patrol_check < interval:
             return
 
-        self.busy = True
+        self._set_state(BotState.PATROLLING)
         try:
             self._last_patrol_check = now
             result = self._check_patrol_zone(ih, matcher)
@@ -663,7 +794,7 @@ class ScenarioRunner:
             self._walk_in_direction(ih, 0.0, steps=steps)  # 0 = straight ahead
 
         finally:
-            self.busy = False
+            self._clear_state()
 
     def _rotate_camera_by_angle(
         self, ih: InputHandler, target_angle: float,
@@ -790,7 +921,8 @@ class ScenarioRunner:
             "loot_on_dead_target": self.loot_on_dead_target,
             "pre_orient_to_next_mob": self.pre_orient_to_next_mob,
             "return_to_patrol_zone": self.return_to_patrol_zone,
-            "move_to_mobs_and_attack_if_no_target": self.move_to_mobs_and_attack_if_no_target,
+            "attack_mob_in_range": self.attack_mob_in_range,
+            "move_to_mobs": self.move_to_mobs,
             "stop_if_exit_game": self.stop_if_exit_game,
         }
         return [registry[n] for n in names if n in registry]
