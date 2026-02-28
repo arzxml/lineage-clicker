@@ -23,11 +23,16 @@ TEMPLATES_DIR = "assets/templates"
 # Each entry maps a scenario name to a dict of settings.
 # (populated in bot/scenarios.py)
 ACTIVE_SCENARIOS: list[str] = [
-    "stop_if_exit_game",
+    "read_character_stats",
+    "check_skill_availability",
+    "use_buff_skills",
+    "check_target_died",
     "loot_on_dead_target",
-    "pre_orient_to_next_mob",
+    "check_mobs_in_range",
     "return_to_patrol_zone",
+    "pre_orient_to_next_mob",
     "attack_mob_in_range",
+    "target_mob_in_range",
     "move_to_mobs",
     # "assist_ppl_then_attack_on_dead_or_non_existing_target",
     # "auto_attack",
@@ -35,7 +40,7 @@ ACTIVE_SCENARIOS: list[str] = [
 ]
 
 # Screen regions (x, y, w, h)
-REGION_HP_BAR    = (0, 0, 382, 87)
+REGION_GENERAL_STATS    = (0, 0, 381, 83)
 REGION_TARGET    = (382, 0, 384, 53)
 REGION_TARGET_HP_BAR = (403, 23, 356, 12)   # just the HP fill strip inside the target frame
 REGION_BUFFS    = (763, 1, 470, 96)
@@ -44,7 +49,9 @@ REGION_ACTION_BAR = (2, 746, 344, 126)
 REGION_CHAT = (2, 876, 343, 136)
 REGION_MINIMAP = (1712, 1, 205, 206)
 REGION_GENERAL_MENU = (1752, 590, 168, 476)
-REGION_MAP = (3, 84, 437, 525)
+REGION_MAP = (3, 84, 437, 525) # Where the map is opened with "alt + m" is pressed
+REGION_SKILL_LIST = (3, 84, 307, 519) # Where list of skills open when "alt + k" is pressed
+REGION_SKILL_HOT_BAR = (1646, 210, 272, 507)
 
 # Action keyboard keys
 KEY_ATTACK = "f1"
@@ -56,18 +63,19 @@ KEY_NEXT_TARGET = "f10"
 # Movement
 MOVE_CLICK_RADIUS = 700   # how far (px) from screen center to click when walking (directional)
 MOVE_FORWARD_CLICK_PX = 250  # how far above screen center to click when walking forward
-MOB_CLOSE_RANGE   = 0.1  # normalised minimap distance (0–1) at which mob is "close enough"
+MOB_CLOSE_RANGE   = 0.09  # normalised minimap distance (0–1) at which mob is "close enough"
 MOB_MELEE_RANGE   = 0.03  # mob this close is likely attacking us — fight before looting
-
-# Cooldown
-LOOT_COOLDOWN     = 1.0   # seconds to wait after looting before moving on
 
 # Camera
 CAMERA_TILT_UP_PX    = 5    # px to drag up from top-down (small! too much = sky)
 CAMERA_ROTATE_MAX_PX = 50   # max px to drag left/right for a full 180° rotation
+CAMERA_PX_PER_RAD    = 19.0 # pixels of right-drag per radian of CW camera rotation (calibrated)
 
 # Pre-orient: HP ratio below which the bot starts orienting to the next mob
 PRE_ORIENT_HP_THRESHOLD = 0.10  # roughly ≈15 % HP remaining
+
+# Skill availability
+SKILL_CHECK_INTERVAL = 10.0     # seconds between skill-window checks
 
 # Patrol zone
 PATROL_CHECK_INTERVAL = 30.0    # seconds between map checks
