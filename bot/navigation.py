@@ -46,58 +46,84 @@ def rotate_camera_toward_mob(
     check_exit: CheckExitFn = None,
     capture: Optional[ScreenCapture] = None,
 ) -> bool:
-    """Rotate the camera so the nearest mob is directly north on the minimap.
+    """Rotate camera until a mob is directly north on the minimap.
 
-    Returns ``True`` if the mob ended up roughly north, ``False`` if lost.
+    Holds right-mouse-button and moves the mouse in small steps.
+    This avoids the overhead of full press/move/release per nudge.
+
+    Logic:
+      1. If any mob is already in the north cone → done.
+      2. Pick a direction based on nearest mob, commit to it.
+      3. Hold right-click, nudge mouse step-by-step until a mob is north.
+
+    Returns ``True`` if a mob ended up north, ``False`` if all mobs lost.
     """
     _cap = capture or ScreenCapture()
-    px_per_rad = getattr(config, "CAMERA_PX_PER_RAD", 19.0)
     cx, cy = get_screen_center(_cap)
 
-    _rot_t0 = _time.monotonic()
-    for i in range(6):
-        frame = _cap.grab()
-        r = vision.find_nearest_mob_on_minimap(frame, target_dist=mob_dist)
-        if r is None:
-            log.debug(
-                f"[camera:rotate] pass {i+1}/6 – mob lost on minimap "
-                f"({(_time.monotonic()-_rot_t0)*1000:.0f}ms elapsed)"
-            )
-            return False
+    north_cone_deg = getattr(config, "CAMERA_NORTH_THRESHOLD_DEG", 20)
+    step_px        = getattr(config, "CAMERA_STEP_PX", 1)
+    max_passes     = getattr(config, "CAMERA_MAX_PASSES", 180)
+    settle_ms      = getattr(config, "CAMERA_SETTLE_MS", 30) / 1000.0
 
-        dx, dy, dist = r
-        angle = math.atan2(dx, -dy)
-        log.debug(
-            f"[camera:rotate] pass {i+1}/6 – mob_angle={math.degrees(angle):+.1f}° "
-            f"dx={dx:.3f} dy={dy:.3f} dist={dist:.2f}"
-        )
+    # ── 1. Already have a mob at north? ──────────────────────────
+    frame = _cap.grab()
+    if vision.has_mob_at_north(frame, half_cone_deg=north_cone_deg):
+        log.debug("[camera:rotate] mob already at north – no rotation needed")
+        return True
 
-        if abs(angle) < 0.17:
-            log.debug(
-                f"[camera:rotate] converged in {i+1} passes "
-                f"({(_time.monotonic()-_rot_t0)*1000:.0f}ms)"
-            )
-            return True
+    # ── 2. Pick a committed direction ────────────────────────────
+    r = vision.find_nearest_mob_on_minimap(frame, target_dist=mob_dist)
+    if r is None:
+        log.debug("[camera:rotate] no mobs on minimap – cannot orient")
+        return False
 
-        correction = int(angle * px_per_rad * 0.4)
-        correction = max(-150, min(150, correction))
-        if correction == 0:
-            correction = 1 if angle > 0 else -1
-        log.debug(
-            f"[camera:rotate] dragging {correction:+d}px "
-            f"(40% of {int(angle * px_per_rad)}px)"
-        )
-        ih.drag_to(cx, cy, cx + correction, cy, duration=0.15, button="right")
-        sleep(0.2)
-
-        if check_exit:
-            check_exit()
-
+    dx, dy, dist = r
+    angle = math.atan2(dx, -dy)                     # +ve = mob is to the right
+    direction = 1 if angle > 0 else -1               # commit: never change
     log.debug(
-        f"[camera:rotate] max 6 passes reached, best effort "
-        f"({(_time.monotonic()-_rot_t0)*1000:.0f}ms)"
+        f"[camera:rotate] mob at {math.degrees(angle):+.1f}° – "
+        f"will nudge {'right' if direction > 0 else 'left'}"
     )
-    return True
+
+    # ── 3. Hold right-click and nudge ───────────────────────────
+    ih.move_to(cx, cy)
+    sleep(0.02)
+    ih.mouse_down("right")
+    sleep(0.02)
+
+    current_x = cx
+    success = False
+    try:
+        for i in range(max_passes):
+            current_x += direction * step_px
+            ih.move_to(current_x, cy)
+            sleep(settle_ms)
+
+            frame = _cap.grab()
+
+            if vision.has_mob_at_north(frame, half_cone_deg=north_cone_deg):
+                log.debug(
+                    f"[camera:rotate] mob entered north cone after {i+1} nudges"
+                )
+                success = True
+                break
+
+            # If ALL mobs disappeared, bail out
+            if vision.find_nearest_mob_on_minimap(frame) is None:
+                log.debug(f"[camera:rotate] all mobs lost after {i+1} nudges")
+                break
+
+            if check_exit:
+                check_exit()
+
+        if not success:
+            log.debug(f"[camera:rotate] max {max_passes} nudges reached")
+    finally:
+        ih.mouse_up("right")
+        sleep(0.02)
+
+    return success
 
 
 def rotate_camera_by_angle(

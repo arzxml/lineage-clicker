@@ -121,6 +121,76 @@ def is_exit_visible(frame: np.ndarray, matcher: TemplateMatcher) -> bool:
 #  Minimap mob detection
 # ─────────────────────────────────────────────────────────────────
 
+def _find_all_mobs_on_minimap(
+    frame: np.ndarray,
+    min_dist: Optional[float] = None,
+) -> list[tuple[float, float, float]]:
+    """Return a list of ``(dx, dy, dist)`` for every red dot on the minimap.
+
+    Each entry has *dx*/*dy* normalised to [-1, 1] and *dist* normalised
+    (0 = centre, 1 = edge).
+    """
+    rx, ry, rw, rh = config.REGION_MINIMAP
+    minimap = frame[ry:ry + rh, rx:rx + rw]
+
+    h, w = minimap.shape[:2]
+    center_x, center_y = w // 2, h // 2
+    radius = min(center_x, center_y)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (center_x, center_y), radius, 255, -1)
+
+    hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
+    lo1 = np.array([0, 100, 80], dtype=np.uint8)
+    hi1 = np.array([10, 255, 255], dtype=np.uint8)
+    lo2 = np.array([165, 100, 80], dtype=np.uint8)
+    hi2 = np.array([180, 255, 255], dtype=np.uint8)
+    red_mask = cv2.inRange(hsv, lo1, hi1) | cv2.inRange(hsv, lo2, hi2)
+    red_mask = cv2.bitwise_and(red_mask, mask)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(
+        red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    )
+    mobs: list[tuple[float, float, float]] = []
+    for cnt in contours:
+        M = cv2.moments(cnt)
+        if M["m00"] == 0:
+            continue
+        mx = int(M["m10"] / M["m00"])
+        my = int(M["m01"] / M["m00"])
+        cdx = mx - center_x
+        cdy = my - center_y
+        dist_px = math.hypot(cdx, cdy)
+        if dist_px < 5:          # skip player dot
+            continue
+        norm_dx = cdx / radius
+        norm_dy = cdy / radius
+        norm_dist = math.hypot(norm_dx, norm_dy)
+        if min_dist is not None and norm_dist < min_dist:
+            continue
+        mobs.append((norm_dx, norm_dy, norm_dist))
+    return mobs
+
+
+def has_mob_at_north(
+    frame: np.ndarray,
+    half_cone_deg: float = 30.0,
+    min_dist: Optional[float] = None,
+) -> bool:
+    """Return True if any mob on the minimap is roughly north (in front).
+
+    *half_cone_deg*: half-width of the north cone in degrees.
+    """
+    half_cone = math.radians(half_cone_deg)
+    for dx, dy, dist in _find_all_mobs_on_minimap(frame, min_dist=min_dist):
+        angle = math.atan2(dx, -dy)
+        if abs(angle) <= half_cone:
+            return True
+    return False
+
+
 def find_nearest_mob_on_minimap(
     frame: np.ndarray,
     target_dist: Optional[float] = None,
@@ -142,67 +212,18 @@ def find_nearest_mob_on_minimap(
         Ignore mobs closer than this normalised distance (e.g. the mob
         we are currently fighting).
     """
-    rx, ry, rw, rh = config.REGION_MINIMAP
-    minimap = frame[ry:ry + rh, rx:rx + rw]
-
-    # Circular mask – the minimap is round
-    h, w = minimap.shape[:2]
-    center_x, center_y = w // 2, h // 2
-    radius = min(center_x, center_y)
-    mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.circle(mask, (center_x, center_y), radius, 255, -1)
-
-    # Detect red pixels in HSV (red wraps around H=0/180)
-    hsv = cv2.cvtColor(minimap, cv2.COLOR_BGR2HSV)
-    lo1 = np.array([0, 100, 80], dtype=np.uint8)
-    hi1 = np.array([10, 255, 255], dtype=np.uint8)
-    lo2 = np.array([165, 100, 80], dtype=np.uint8)
-    hi2 = np.array([180, 255, 255], dtype=np.uint8)
-    red_mask = cv2.inRange(hsv, lo1, hi1) | cv2.inRange(hsv, lo2, hi2)
-    red_mask = cv2.bitwise_and(red_mask, mask)
-
-    # Clean up noise
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
-
-    # Find contours of red blobs
-    contours, _ = cv2.findContours(
-        red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-    )
-    if not contours:
+    mobs = _find_all_mobs_on_minimap(frame, min_dist=min_dist)
+    if not mobs:
         return None
 
     best_score = float("inf")
-    best_dx, best_dy, best_norm_dist = 0.0, 0.0, 0.0
-    for cnt in contours:
-        M = cv2.moments(cnt)
-        if M["m00"] == 0:
-            continue
-        mx = int(M["m10"] / M["m00"])
-        my = int(M["m01"] / M["m00"])
-        cdx = mx - center_x
-        cdy = my - center_y
-        dist_px = math.hypot(cdx, cdy)
-        # Skip the very centre (that's the player, not a mob)
-        if dist_px < 5:
-            continue
-        norm_dx = cdx / radius
-        norm_dy = cdy / radius
-        norm_dist = math.hypot(norm_dx, norm_dy)
-
-        if min_dist is not None and norm_dist < min_dist:
-            continue
-
+    best: tuple[float, float, float] | None = None
+    for dx, dy, dist in mobs:
         if target_dist is not None:
-            score = abs(norm_dist - target_dist)
+            score = abs(dist - target_dist)
         else:
-            score = dist_px
-
+            score = dist   # closest to centre
         if score < best_score:
             best_score = score
-            best_dx, best_dy = norm_dx, norm_dy
-            best_norm_dist = norm_dist
-
-    if best_score == float("inf"):
-        return None
-    return best_dx, best_dy, best_norm_dist
+            best = (dx, dy, dist)
+    return best

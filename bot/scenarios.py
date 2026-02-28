@@ -91,6 +91,15 @@ class ScenarioRunner:
 
         self._last_skill_check: float = 0.0             # throttle skill window opens
 
+        # Target HP stall detection – if HP ratio hasn't changed for
+        # several seconds while ATTACKING, the mob is likely dead and
+        # we're seeing residual red UI decoration.
+        self._last_target_hp: float = -1.0
+        self._target_hp_stall_since: float = 0.0
+
+        # Periodic re-attack: re-press attack key while ATTACKING
+        self._last_attack_press: float = 0.0
+
         # Shared screen-capture handle (avoid re-allocating mss per call)
         self.capture = ScreenCapture()
 
@@ -216,8 +225,15 @@ class ScenarioRunner:
         Sets state to ATTACKING so subsequent ticks skip this scenario
         until the target dies or disappears.
         """
-        # Already attacking — nothing to do until target dies
+        # While ATTACKING, periodically re-press attack key in case
+        # auto-attack dropped (mob moved, lag, character interrupted, etc.)
         if self._state == BotState.ATTACKING:
+            interval = getattr(config, "ATTACK_REPRESS_INTERVAL", 3.0)
+            now = _time.monotonic()
+            if now - self._last_attack_press >= interval:
+                log.debug("[attack:repress] re-pressing attack key (keep-alive)")
+                ih.press(config.KEY_ATTACK)
+                self._last_attack_press = now
             return
         if self._state not in (BotState.IDLE, BotState.IN_RANGE, BotState.TARGET_ACQUIRED):
             return
@@ -226,10 +242,16 @@ class ScenarioRunner:
         # Don't attack a dead target (avoids double-loot cycle)
         if not vision.target_has_hp(frame):
             log.debug("[attack:skip] target HP is 0 – won't attack a dead target")
+            # If we just came from TARGET_ACQUIRED (buff phase) and mob died
+            # in the meantime, go straight to TARGET_KILLED so loot picks it up.
+            if self._state == BotState.TARGET_ACQUIRED:
+                log.debug("[attack:skip] was TARGET_ACQUIRED → TARGET_KILLED (mob died during buffs)")
+                self._set_state(BotState.TARGET_KILLED)
             return
 
         log.debug("[attack:engage] target alive with HP – pressing attack key")
         ih.press(config.KEY_ATTACK)
+        self._last_attack_press = _time.monotonic()
         self._set_state(BotState.ATTACKING)
 
     async def move_to_mobs(
@@ -280,6 +302,9 @@ class ScenarioRunner:
         Runs while ATTACKING.  When the target's HP drops to zero,
         transitions to TARGET_KILLED so loot_on_dead_target picks it up.
         If the target disappears entirely, go back to IDLE.
+        Also detects "stale HP" – if the HP ratio is unchanged for
+        several seconds, the mob likely died but residual red pixels
+        (UI decoration) keep the ratio non-zero.
         """
         if self._state != BotState.ATTACKING:
             return
@@ -288,12 +313,36 @@ class ScenarioRunner:
         if not has_tgt:
             # Target gone (despawned / out of range) — back to idle
             log.debug("[combat:died] target frame disappeared (despawned/out of range) → IDLE")
+            self._last_target_hp = -1.0
             self._clear_state()
             return
 
         if vision.target_is_dead(frame, matcher, capture=self.capture):
             log.debug("[combat:died] target HP confirmed empty → TARGET_KILLED")
+            self._last_target_hp = -1.0
             self._set_state(BotState.TARGET_KILLED)
+            return
+
+        # ---- HP stall detection ----
+        hp = vision.target_hp_ratio(frame)
+        now = _time.monotonic()
+        stall_timeout = getattr(config, "TARGET_HP_STALL_TIMEOUT", 4.0)
+
+        if abs(hp - self._last_target_hp) < 0.005:
+            # HP hasn't changed
+            stall_dur = now - self._target_hp_stall_since
+            if stall_dur >= stall_timeout:
+                log.warning(
+                    f"[combat:stall] target HP stuck at {hp:.3f} for "
+                    f"{stall_dur:.1f}s – treating as dead → TARGET_KILLED"
+                )
+                self._last_target_hp = -1.0
+                self._set_state(BotState.TARGET_KILLED)
+                return
+        else:
+            # HP changed – reset stall timer
+            self._last_target_hp = hp
+            self._target_hp_stall_since = now
 
     async def loot_on_dead_target(
         self,
@@ -339,77 +388,80 @@ class ScenarioRunner:
         bus: EventBus,
         event: Optional[dict] = None,
     ) -> None:
-        """While fighting, if target HP is low, pre-orient toward next mob.
+        """While attacking, pre-aim the camera at the next mob.
 
-        Saves several seconds between kills by doing the top-down →
-        minimap-read → rotate sequence *before* the current target dies.
+        Only activates when:
+          - We are currently attacking a target.
+          - We haven't already pre-oriented.
+          - There are NO other mobs nearby (within close range).  If
+            there are nearby mobs we'll just target one of those next,
+            so camera adjustment is pointless.
+
+        When those conditions are met, the camera is rotated toward the
+        nearest *distant* mob so that when the current target dies we
+        can walk straight forward instead of having to orient first.
         """
-        if self._state not in (BotState.IDLE, BotState.ATTACKING):
+        if self._state != BotState.ATTACKING:
             return
         if self._pre_oriented:
             return
         if not vision.has_target(frame, matcher):
             return
 
-        ratio = vision.target_hp_ratio(frame)
-        threshold = getattr(config, "PRE_ORIENT_HP_THRESHOLD", 0.10)
-        if ratio > threshold or ratio <= 0.01:
-            # HP not low enough, or target already dead
+        close_range = getattr(config, "MOB_CLOSE_RANGE", 0.15)
+
+        # Check if there are OTHER mobs nearby (skip the one we're fighting,
+        # which sits at the very centre of the minimap / very close range).
+        all_mobs = vision._find_all_mobs_on_minimap(frame)
+        nearby_others = [
+            m for m in all_mobs
+            if m[2] <= close_range and m[2] > 0.02  # > 0.02 to skip the player dot
+        ]
+        if nearby_others:
+            # There are mobs close by — no need to rotate
+            return
+
+        # Find the nearest mob beyond close range (the next target)
+        result = vision.find_nearest_mob_on_minimap(
+            frame, min_dist=close_range,
+        )
+        if result is None:
+            # No distant mobs either — nothing to aim at
+            return
+
+        # Already roughly north? Mark as pre-oriented.
+        north_cone = getattr(config, "CAMERA_NORTH_THRESHOLD_DEG", 20)
+        dx, dy, dist = result
+        angle = math.atan2(dx, -dy)
+        if abs(angle) < math.radians(north_cone):
+            self._pre_oriented = True
+            log.debug(
+                f"[pre_orient:ok] next mob already at north "
+                f"({math.degrees(angle):+.1f}°) – no rotation needed"
+            )
             return
 
         _po_t0 = _time.monotonic()
-        try:
-            log.debug(
-                f"[pre_orient:start] target HP low ({ratio:.3f} < {threshold:.2f}) – "
-                f"rotating camera toward next mob"
-            )
-            # No top-down reset here — minimap works at any pitch
-            # and rotate_camera_toward_mob only drags horizontally.
-            frame = self.capture.grab()
-            # Look for mobs beyond close range (skip the one we're fighting)
-            close_range = getattr(config, "MOB_CLOSE_RANGE", 0.15)
-            result = vision.find_nearest_mob_on_minimap(
-                frame, min_dist=close_range,
-            )
-            if result is None:
-                log.debug("[pre_orient:abort] no next mob found on minimap (beyond close range)")
-                return
+        log.debug(
+            f"[pre_orient:start] no nearby mobs – rotating toward "
+            f"next mob at {math.degrees(angle):+.1f}° dist={dist:.2f}"
+        )
 
-            dx, dy, dist = result
+        if navigation.rotate_camera_toward_mob(
+            ih, mob_dist=dist,
+            check_exit=lambda: self._check_exit(matcher),
+            capture=self.capture,
+        ):
+            self._pre_oriented = True
             log.debug(
-                f"[pre_orient:found] next mob dir=({dx:.2f},{dy:.2f}) "
-                f"dist={dist:.2f} – rotating camera"
+                f"[pre_orient:success] camera aimed at next mob "
+                f"({(_time.monotonic()-_po_t0)*1000:.0f}ms)"
             )
-
-            if navigation.rotate_camera_toward_mob(
-                ih, mob_dist=dist,
-                check_exit=lambda: self._check_exit(matcher),
-                capture=self.capture,
-            ):
-                # Verify mob is actually roughly north before claiming success
-                frame = self.capture.grab()
-                check = vision.find_nearest_mob_on_minimap(
-                    frame, min_dist=close_range,
-                )
-                if check is not None:
-                    verify_angle = math.atan2(check[0], -check[1])
-                    if abs(verify_angle) < 0.6:  # within ~35°
-                        self._pre_oriented = True
-                        log.debug(
-                            f"[pre_orient:success] verified angle={math.degrees(verify_angle):.1f}° "
-                            f"({(_time.monotonic()-_po_t0)*1000:.0f}ms)"
-                        )
-                    else:
-                        log.debug(
-                            f"[pre_orient:fail] verify angle={math.degrees(verify_angle):.1f}° "
-                            f"exceeds 35° threshold ({(_time.monotonic()-_po_t0)*1000:.0f}ms)"
-                        )
-                else:
-                    log.debug(f"[pre_orient:fail] mob lost during verification ({(_time.monotonic()-_po_t0)*1000:.0f}ms)")
-            else:
-                log.debug(f"[pre_orient:fail] mob lost during camera rotation ({(_time.monotonic()-_po_t0)*1000:.0f}ms)")
-        finally:
-            pass
+        else:
+            log.debug(
+                f"[pre_orient:fail] mob lost during rotation "
+                f"({(_time.monotonic()-_po_t0)*1000:.0f}ms)"
+            )
 
     async def return_to_patrol_zone(
         self,
@@ -705,8 +757,12 @@ class ScenarioRunner:
                 self._execute_buff_action(post, fresh, matcher, ih)
                 sleep(0.2)
 
-        # Done – transition to ATTACKING (attack_mob_in_range will press attack)
-        log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) – ready to attack")
+        # Done – press attack and transition to ATTACKING
+        log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) – pressing attack")
+        ih.press(config.KEY_ATTACK)
+        self._last_attack_press = _time.monotonic()
+        self._set_state(BotState.ATTACKING)
+        log.debug("[buff:done] attack key sent – now ATTACKING")
 
     def _check_buff_conditions(self, conditions: dict) -> bool:
         """Evaluate buff conditions against current character stats.

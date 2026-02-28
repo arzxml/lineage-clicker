@@ -328,6 +328,16 @@ class Interception:
             time.sleep(duration / steps)
         self._send_mouse(state=up_flag)
 
+    def mouse_down(self, button: str = "left") -> None:
+        """Press a mouse button without releasing."""
+        down_flag, _ = _MOUSE_BTN[button]
+        self._send_mouse(state=down_flag)
+
+    def mouse_up(self, button: str = "left") -> None:
+        """Release a mouse button."""
+        _, up_flag = _MOUSE_BTN[button]
+        self._send_mouse(state=up_flag)
+
     # ── Helpers ───────────────────────────────────────────────────────
 
     @staticmethod
