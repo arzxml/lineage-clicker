@@ -2,10 +2,14 @@
 #  config.py  –  central configuration
 # ─────────────────────────────────────────────
 
+# ── Identity ─────────────────────────────────
+CHARACTER_NAME = "slibinas"   # included in every outgoing event so remotes know the sender
+
 # ── Network ──────────────────────────────────
 ROLE = "server"          # "server" | "client"
 SERVER_HOST = "0.0.0.0"  # server: bind address  /  client: server IP
 SERVER_PORT = 8765
+REMOTE_STATE_FILE = "remote_state.json"  # persisted snapshot of all remote characters
 
 # ── Screen capture ────────────────────────────
 # Monitor index (0 = all monitors, 1 = primary, 2 = secondary …)
@@ -23,6 +27,7 @@ TEMPLATES_DIR = "assets/templates"
 # Each entry maps a scenario name to a dict of settings.
 # (populated in bot/scenarios.py)
 ACTIVE_SCENARIOS: list[str] = [
+    "handle_remote_events",
     "read_character_stats",
     "check_skill_availability",
     "use_buff_skills",
@@ -76,6 +81,33 @@ PRE_ORIENT_HP_THRESHOLD = 0.10  # roughly ≈15 % HP remaining
 
 # Skill availability
 SKILL_CHECK_INTERVAL = 10.0     # seconds between skill-window checks
+
+# Combat skills to use during fights (template name = "skill-{key}").
+# Each entry: conditions (when to use), pre/post actions.
+COMBAT_SKILLS: dict[str, dict] = {}
+
+# Toggle skills that can be switched on/off (e.g. Vicious Stance).
+# Always considered available — no hot-bar availability tracking needed.
+# Each entry: conditions (when to toggle on/off), pre/post actions.
+TOGGLE_SKILLS: dict[str, dict] = {}
+
+# Buff skills to auto-use when conditions are met.
+# Each entry: conditions (when to use), pre/post actions (equip swaps, etc.).
+# All keys from BUFF_SKILLS and COMBAT_SKILLS are automatically tracked
+# for availability on the hot bar.
+BUFF_SKILLS: dict[str, dict] = {
+    # Skills for destroyer
+    "Rage": {
+        "conditions": {},
+        "pre":  {"equip_item": "Knife"},
+        "post": {"equip_item": "Elven Long Sword"},
+    },
+    "Frenzy": {
+        "conditions": {"hp_below_percent": 30},
+        "pre":  {"equip_item": "Knife"},
+        "post": {"equip_item": "Elven Long Sword"},
+    },
+}
 
 # Patrol zone
 PATROL_CHECK_INTERVAL = 30.0    # seconds between map checks
