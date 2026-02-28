@@ -13,7 +13,7 @@ REMOTE_STATE_FILE = "remote_state.json"  # persisted snapshot of all remote char
 
 # ── Screen capture ────────────────────────────
 # Monitor index (0 = all monitors, 1 = primary, 2 = secondary …)
-MONITOR_INDEX = 1
+MONITOR_INDEX = 2
 # How many times per second we capture the screen
 CAPTURE_FPS = 5
 
@@ -72,10 +72,12 @@ MOB_CLOSE_RANGE   = 0.09  # normalised minimap distance (0–1) at which mob is 
 MOB_MELEE_RANGE   = 0.03  # mob this close is likely attacking us — fight before looting
 
 # Camera
-CAMERA_TILT_UP_PX    = 5    # px to drag up from top-down (small! too much = sky)
-CAMERA_ROTATE_MAX_PX = 50   # max px to drag left/right for a full 180° rotation
-CAMERA_PX_PER_RAD    = 19.0 # pixels of right-drag per radian of CW camera rotation (calibrated)
-
+CAMERA_TILT_UP_PX          = 5     # px to drag up from top-down (small! too much = sky)
+CAMERA_ROTATE_MAX_PX       = 50    # max px to drag left/right for a full 180° rotation
+CAMERA_PX_PER_RAD          = 19.0  # pixels of right-drag per radian of CW camera rotation (calibrated)
+CAMERA_NORTH_THRESHOLD_DEG = 5    # degrees – half-width of "north" cone
+CAMERA_STEP_PX             = 1     # px per nudge (1 = smallest possible mouse step)
+CAMERA_MAX_PASSES          = 180   # max nudge iterations before giving upCAMERA_SETTLE_MS           = 30    # ms to wait after each mouse move for the game to update
 # Pre-orient: HP ratio below which the bot starts orienting to the next mob
 PRE_ORIENT_HP_THRESHOLD = 0.10  # roughly ≈15 % HP remaining
 

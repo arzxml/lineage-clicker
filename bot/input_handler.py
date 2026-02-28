@@ -39,6 +39,14 @@ class InputHandler:
     ) -> None:
         self._drv.drag_to(x1, y1, x2, y2, duration=duration, button=button)
 
+    def mouse_down(self, button: str = "left") -> None:
+        """Press a mouse button without releasing."""
+        self._drv.mouse_down(button)
+
+    def mouse_up(self, button: str = "left") -> None:
+        """Release a mouse button."""
+        self._drv.mouse_up(button)
+
     # ── Keyboard ──────────────────────────────────────────────────────
 
     def press(self, key: str) -> None:
