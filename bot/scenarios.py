@@ -1031,7 +1031,15 @@ class ScenarioRunner:
                 # If HP hasn't dropped since we entered ATTACKING,
                 # the bot hasn't truly engaged yet – keep fighting.
                 hp_ref = self._chain_hp_at_combat_start
-                if hp_ref > 0 and self.hp_current >= hp_ref:
+                if hp_ref == 0 and self.hp_current > 0:
+                    # OCR wasn't ready when we entered ATTACKING –
+                    # adopt the first valid reading as our baseline.
+                    self._chain_hp_at_combat_start = self.hp_current
+                    hp_ref = self.hp_current
+                    log.debug(
+                        f"[chain:{chain_name}] late HP snapshot: {hp_ref}"
+                    )
+                if hp_ref == 0 or self.hp_current >= hp_ref:
                     log.debug(
                         f"[chain:{chain_name}] HP {self.hp_current}/{hp_ref} "
                         f"– no damage taken yet, keep attacking"
