@@ -180,9 +180,17 @@ def _find_all_mobs_on_minimap(
 def count_mobs_on_minimap(
     frame: np.ndarray,
     min_dist: Optional[float] = None,
+    max_dist: Optional[float] = None,
 ) -> int:
-    """Return the number of mob dots visible on the minimap."""
-    return len(_find_all_mobs_on_minimap(frame, min_dist=min_dist))
+    """Return the number of mob dots visible on the minimap.
+
+    *max_dist* (normalised, 0-1) caps the search radius so only nearby
+    mobs are counted.
+    """
+    mobs = _find_all_mobs_on_minimap(frame, min_dist=min_dist)
+    if max_dist is not None:
+        mobs = [m for m in mobs if m[2] <= max_dist]
+    return len(mobs)
 
 
 def has_mob_at_north(

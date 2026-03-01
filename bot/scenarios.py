@@ -1024,7 +1024,7 @@ class ScenarioRunner:
                 # Check safety: mob count
                 conditions = chain_cfg.get("conditions", {})
                 max_mobs = conditions.get("max_nearby_mobs", 999)
-                mob_count = vision.count_mobs_on_minimap(frame)
+                mob_count = vision.count_mobs_on_minimap(frame, max_dist=config.MOB_CLOSE_RANGE)
                 if mob_count > max_mobs:
                     log.debug(
                         f"[chain:{chain_name}] {mob_count} mobs on minimap "
@@ -1077,7 +1077,7 @@ class ScenarioRunner:
                     # Re-check mob count – if it increased, abort for safety
                     conditions = chain_cfg.get("conditions", {})
                     max_mobs = conditions.get("max_nearby_mobs", 999)
-                    mob_count = vision.count_mobs_on_minimap(frame)
+                    mob_count = vision.count_mobs_on_minimap(frame, max_dist=config.MOB_CLOSE_RANGE)
                     if mob_count > max_mobs:
                         log.warning(
                             f"[chain:{chain_name}] mob count rose to "
