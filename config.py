@@ -23,7 +23,7 @@ CAPTURE_FPS = 5
 # How often the background OCR thread reads stats (seconds).
 # OCR takes ~2.8 s on CPU, so it runs on a separate thread to
 # keep the main bot loop fast.
-OCR_INTERVAL = 5.0
+OCR_INTERVAL = 2.0
 
 # ── Template matching ─────────────────────────
 # Minimum confidence (0–1) for a template match to be accepted
@@ -96,7 +96,7 @@ CAMERA_RECENTER_EVERY      = 30    # re-grip mouse every N nudges to avoid drag-
 PRE_ORIENT_HP_THRESHOLD = 0.10  # roughly ≈15 % HP remaining
 
 # Skill availability
-SKILL_CHECK_INTERVAL = 3.0      # seconds between skill-window checks
+SKILL_CHECK_INTERVAL = 1.0      # seconds between skill-window checks
 SKILL_BRIGHTNESS_RATIO = 0.90   # if matched region brightness < ratio * template brightness → on cooldown
 SKILL_TIMER_DIFF_THRESH = 25.0  # mean pixel diff between live center & template center → timer overlay
 

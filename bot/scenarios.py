@@ -377,6 +377,63 @@ class ScenarioRunner:
         y2 = min(frame.shape[0], y1 + th)
         return frame[y1:y2, x1:x2]
 
+    def _check_skill_ready(
+        self,
+        skill_name: str,
+        frame: np.ndarray,
+        matcher: "TemplateMatcher",
+    ) -> bool:
+        """Real-time single-skill availability check (brightness + timer diff).
+
+        Returns *True* if the skill appears usable right now.  Also
+        updates ``self.skill_availability[skill_name]`` so the cached
+        value stays current.
+        """
+        template_name = f"skill-{skill_name}"
+        cached_pos = self._hotbar_pos(template_name)
+        if cached_pos is None:
+            return True  # not cached – assume available
+
+        tpl_img = matcher.get_template(template_name)
+        if tpl_img is None:
+            return True
+
+        region_crop = self._hotbar_crop(frame, template_name)
+        if region_crop is None:
+            return True
+
+        brightness_ratio = getattr(config, "SKILL_BRIGHTNESS_RATIO", 0.90)
+        tpl_brightness = cv2.cvtColor(tpl_img, cv2.COLOR_BGR2GRAY).mean()
+        region_brightness = cv2.cvtColor(region_crop, cv2.COLOR_BGR2GRAY).mean()
+        b_ratio = region_brightness / tpl_brightness if tpl_brightness > 0 else 1.0
+        available = b_ratio >= brightness_ratio
+
+        # Timer overlay check (digits over the icon centre).
+        if available:
+            gray_crop = cv2.cvtColor(region_crop, cv2.COLOR_BGR2GRAY)
+            gray_tpl = cv2.cvtColor(tpl_img, cv2.COLOR_BGR2GRAY)
+            h, w = gray_crop.shape[:2]
+            ht, wt = gray_tpl.shape[:2]
+            y1c, y2c = int(h * 0.2), int(h * 0.8)
+            x1c, x2c = int(w * 0.2), int(w * 0.8)
+            center_crop = gray_crop[y1c:y2c, x1c:x2c]
+            y1t, y2t = int(ht * 0.2), int(ht * 0.8)
+            x1t, x2t = int(wt * 0.2), int(wt * 0.8)
+            center_tpl = gray_tpl[y1t:y2t, x1t:x2t]
+            ch, cw = center_crop.shape[:2]
+            if center_tpl.shape[:2] != (ch, cw):
+                center_tpl = cv2.resize(center_tpl, (cw, ch))
+            diff = cv2.absdiff(center_crop, center_tpl).mean()
+            timer_diff_thresh = getattr(config, "SKILL_TIMER_DIFF_THRESH", 25.0)
+            if diff > timer_diff_thresh:
+                available = False
+
+        # Update cached availability.
+        if skill_name in self.skill_availability:
+            self.skill_availability[skill_name]["available"] = available
+
+        return available
+
     # ── Scenario methods ─────────────────────────────────────────
 
     async def scan_nearby_mobs(
@@ -1113,14 +1170,57 @@ class ScenarioRunner:
                     continue
 
                 skills = chain_cfg.get("skills", [])
+                conditions = chain_cfg.get("conditions", {})
+
                 all_avail = all(
                     self.skill_availability.get(s, {}).get("available", False)
                     for s in skills
                 )
-                if not all_avail:
-                    continue
 
-                conditions = chain_cfg.get("conditions", {})
+                # When skills look unavailable but HP is already
+                # critical, do a real-time rescan so we react within
+                # one tick (~200 ms) instead of waiting for the next
+                # periodic scan_skill_cooldowns pass.
+                if not all_avail:
+                    urgent = False
+                    char_hp_thresh = conditions.get("hp_below_percent")
+                    if char_hp_thresh is not None:
+                        hp_pct = (
+                            (self.hp_current / self.hp_max * 100)
+                            if self.hp_max > 0 else 100
+                        )
+                        if hp_pct <= char_hp_thresh:
+                            urgent = True
+                    if conditions.get("require_being_attacked") and self.being_attacked:
+                        urgent = True
+
+                    if urgent:
+                        all_avail = all(
+                            self._check_skill_ready(s, frame, matcher)
+                            for s in skills
+                        )
+
+                if not all_avail:
+                    # Log which skills are blocking when HP is critical.
+                    char_hp_thresh = conditions.get("hp_below_percent")
+                    if char_hp_thresh is not None:
+                        hp_pct = (
+                            (self.hp_current / self.hp_max * 100)
+                            if self.hp_max > 0 else 100
+                        )
+                        if hp_pct <= char_hp_thresh:
+                            on_cd = [
+                                s for s in skills
+                                if not self.skill_availability.get(
+                                    s, {}
+                                ).get("available", False)
+                            ]
+                            log.debug(
+                                f"[chain:{chain_name}] HP critical "
+                                f"({hp_pct:.0f}%) but skills on "
+                                f"cooldown: {on_cd}"
+                            )
+                    continue
 
                 # Check require_unavailable: skip if listed skills
                 # are available (a higher-priority chain should fire).
