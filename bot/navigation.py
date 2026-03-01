@@ -279,7 +279,7 @@ def move_to_closest_mob(
     if pre_oriented:
         log.debug(
             "[move:orient] skipping – already pre-oriented from "
-            "pre_orient_to_next_mob"
+            "pre_orient_camera"
         )
     else:
         frame = _cap.grab()

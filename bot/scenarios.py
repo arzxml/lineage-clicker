@@ -60,14 +60,14 @@ class ScenarioRunner:
     def __init__(self, remote_state: Optional[RemoteStateStore] = None) -> None:
         self._state = BotState.IDLE
         self._initialized = False
-        self._pre_oriented = False              # set by pre_orient_to_next_mob
+        self._pre_oriented = False              # set by pre_orient_camera
         self._last_patrol_check: float = 0.0    # monotonic timestamp
         self._returning_to_zone = False         # currently heading back
 
         # Shared store for data received from remote bots
         self.remote_state: RemoteStateStore = remote_state or RemoteStateStore()
 
-        # Character stats (updated by read_character_stats)
+        # Character stats (updated by read_stats_ocr)
         self.char_level: int = 0
         self.cp_current: int = 0
         self.cp_max: int = 0
@@ -143,7 +143,7 @@ class ScenarioRunner:
 
     # ── Scenario methods ─────────────────────────────────────────
 
-    async def check_mobs_in_range(
+    async def scan_nearby_mobs(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -153,10 +153,10 @@ class ScenarioRunner:
     ) -> None:
         """After looting is done, check if another mob is already nearby.
 
-        Runs in LOOTING_DONE state (set by loot_on_dead_target).
+        Runs in LOOTING_DONE state (set by loot_target).
         If a mob is within close range on the minimap, transition to
         IN_RANGE so target/attack scenarios pick it up immediately
-        instead of going through the full move_to_mobs walk cycle.
+        instead of going through the full walk_to_mob cycle.
         """
         if self._state != BotState.LOOTING_DONE:
             return
@@ -174,7 +174,7 @@ class ScenarioRunner:
             log.debug(f"[check_mobs:none] no mob in close range ({dist_str}) → IDLE")
             self._clear_state()
 
-    async def target_mob_in_range(
+    async def acquire_target(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -189,12 +189,12 @@ class ScenarioRunner:
         In IDLE state: single attempt as a quick check.
 
         On success → TARGET_ACQUIRED.
-        On failure  → IDLE (so move_to_mobs can walk closer).
+        On failure  → IDLE (so walk_to_mob can walk closer).
         """
         if self._state not in (BotState.IDLE, BotState.TARGETING_NEARBY_TARGET):
             return
         # In TARGETING_NEARBY_TARGET, always use a fresh frame.  The tick
-        # frame may be seconds stale if loot_on_dead_target ran earlier
+        # frame may be seconds stale if loot_target ran earlier
         # in the same tick (~2.8 s of looting).  The stale frame still
         # shows the old dead target, causing a false-positive here.
         check_frame = self.capture.grab() if self._state == BotState.TARGETING_NEARBY_TARGET else frame
@@ -227,11 +227,11 @@ class ScenarioRunner:
         if self._state == BotState.TARGETING_NEARBY_TARGET:
             log.debug(
                 f"[target:acquire] failed after {max_attempts} attempts "
-                "– falling back to IDLE so move_to_mobs can walk closer"
+                "– falling back to IDLE so walk_to_mob can walk closer"
             )
             self._clear_state()
 
-    async def attack_mob_in_range(
+    async def engage_target(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -279,7 +279,7 @@ class ScenarioRunner:
         self._last_attack_press = _time.monotonic()
         self._set_state(BotState.ATTACKING)
 
-    async def move_to_mobs(
+    async def walk_to_mob(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -289,9 +289,9 @@ class ScenarioRunner:
     ) -> None:
         """Orient the camera and walk toward the nearest mob.
 
-        Only activates when IDLE (after *attack_mob_in_range* failed
+        Only activates when IDLE (after *engage_target* failed
         to acquire a target).  After walking close enough, transitions
-        to IN_RANGE so *attack_mob_in_range* picks it up next tick.
+        to IN_RANGE so *engage_target* picks it up next tick.
         """
         if not self.is_idle:
             return
@@ -314,7 +314,7 @@ class ScenarioRunner:
             self._clear_state()
             raise
 
-    async def check_target_died(
+    async def detect_target_death(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -325,7 +325,7 @@ class ScenarioRunner:
         """Check if the target we are attacking has died.
 
         Runs while ATTACKING.  When the target's HP drops to zero,
-        transitions to TARGET_KILLED so loot_on_dead_target picks it up.
+        transitions to TARGET_KILLED so loot_target picks it up.
         If the target disappears entirely, go back to IDLE.
         Also detects "stale HP" – if the HP ratio is unchanged for
         several seconds, the mob likely died but residual red pixels
@@ -379,7 +379,7 @@ class ScenarioRunner:
             self._last_target_hp = hp
             self._target_hp_stall_since = now
 
-    async def loot_on_dead_target(
+    async def loot_target(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -389,8 +389,8 @@ class ScenarioRunner:
     ) -> None:
         """Loot the dead target.
 
-        Activates in TARGET_KILLED state (set by check_target_died).
-        After looting, transitions to LOOTING_DONE so check_mobs_in_range
+        Activates in TARGET_KILLED state (set by detect_target_death).
+        After looting, transitions to LOOTING_DONE so scan_nearby_mobs
         picks it up.
         """
         if self._state != BotState.TARGET_KILLED:
@@ -417,7 +417,7 @@ class ScenarioRunner:
         sleep(0.1)
         log.debug(f"[loot:done] loot sequence finished ({(_time.monotonic()-_loot_t0)*1000:.0f}ms, {press_count} presses + cancel)")
 
-    async def pre_orient_to_next_mob(
+    async def pre_orient_camera(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -506,7 +506,7 @@ class ScenarioRunner:
             )
 
 
-    async def stop_if_exit_game(
+    async def stop_on_exit_menu(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -521,7 +521,7 @@ class ScenarioRunner:
 
     # ── Remote event handling ─────────────────────────────────
 
-    async def handle_remote_events(
+    async def process_remote_events(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -546,7 +546,7 @@ class ScenarioRunner:
         log.debug(f"[remote:rx] {event_type} from {sender}")
         self.remote_state.update(sender, event)
 
-    async def check_skill_availability(
+    async def scan_skill_cooldowns(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -629,7 +629,7 @@ class ScenarioRunner:
                 "skills": current,
             })
 
-    async def use_buff_skills(
+    async def apply_buffs(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -695,7 +695,7 @@ class ScenarioRunner:
                 sleep(0.2)
 
         # Done – press attack immediately and go straight to ATTACKING.
-        # This avoids waiting for attack_mob_in_range on the next tick.
+        # This avoids waiting for engage_target on the next tick.
         fresh = self.capture.grab()
         if vision.has_target(fresh, matcher) and vision.target_has_hp(fresh):
             log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) – pressing attack → ATTACKING")
@@ -781,7 +781,7 @@ class ScenarioRunner:
 
     # ── OCR-based stat reading ────────────────────────────────────
 
-    async def read_character_stats(
+    async def read_stats_ocr(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -968,7 +968,7 @@ class ScenarioRunner:
     #  REGISTRY  –  name → method name
     # ─────────────────────────────────────────────────────────────────
 
-    async def manage_toggle_skills(
+    async def update_toggle_skills(
         self,
         frame: np.ndarray,
         matcher: TemplateMatcher,
@@ -1041,20 +1041,20 @@ class ScenarioRunner:
             # "auto_attack": self.auto_attack,
             # "loot_nearby": self.loot_nearby,
             # "assist_ppl_then_attack_on_dead_or_non_existing_target": self.assist_ppl_then_attack_on_dead_or_non_existing_target,
-            "handle_remote_events": self.handle_remote_events,
-            "check_target_died": self.check_target_died,
-            "loot_on_dead_target": self.loot_on_dead_target,
-            "pre_orient_to_next_mob": self.pre_orient_to_next_mob,
+            "process_remote_events": self.process_remote_events,
+            "detect_target_death": self.detect_target_death,
+            "loot_target": self.loot_target,
+            "pre_orient_camera": self.pre_orient_camera,
             # "return_to_patrol_zone": self.return_to_patrol_zone,
-            "attack_mob_in_range": self.attack_mob_in_range,
-            "target_mob_in_range": self.target_mob_in_range,
-            "check_mobs_in_range": self.check_mobs_in_range,
-            "read_character_stats": self.read_character_stats,
-            "check_skill_availability": self.check_skill_availability,
-            "use_buff_skills": self.use_buff_skills,
-            "manage_toggle_skills": self.manage_toggle_skills,
-            "move_to_mobs": self.move_to_mobs,
+            "engage_target": self.engage_target,
+            "acquire_target": self.acquire_target,
+            "scan_nearby_mobs": self.scan_nearby_mobs,
+            "read_stats_ocr": self.read_stats_ocr,
+            "scan_skill_cooldowns": self.scan_skill_cooldowns,
+            "apply_buffs": self.apply_buffs,
+            "update_toggle_skills": self.update_toggle_skills,
+            "walk_to_mob": self.walk_to_mob,
             "calibrate_camera": self.calibrate_camera,
-            "stop_if_exit_game": self.stop_if_exit_game,
+            "stop_on_exit_menu": self.stop_on_exit_menu,
         }
         return [registry[n] for n in names if n in registry]

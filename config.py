@@ -30,21 +30,18 @@ TEMPLATES_DIR = "assets/templates"
 # Each entry maps a scenario name to a dict of settings.
 # (populated in bot/scenarios.py)
 ACTIVE_SCENARIOS: list[str] = [
-    "handle_remote_events",
-    "read_character_stats",
-    "check_skill_availability",
-    "use_buff_skills",
-    "manage_toggle_skills",
-    "check_target_died",
-    "loot_on_dead_target",
-    "check_mobs_in_range",
-    "pre_orient_to_next_mob",
-    "attack_mob_in_range",
-    "target_mob_in_range",
-    "move_to_mobs",
-    # "assist_ppl_then_attack_on_dead_or_non_existing_target",
-    # "auto_attack",
-    # "loot_nearby",
+    "process_remote_events",
+    "read_stats_ocr",
+    "scan_skill_cooldowns",
+    "apply_buffs",
+    "update_toggle_skills",
+    "detect_target_death",
+    "loot_target",
+    "scan_nearby_mobs",
+    "pre_orient_camera",
+    "engage_target",
+    "acquire_target",
+    "walk_to_mob",
 ]
 
 # Screen regions (x, y, w, h)
