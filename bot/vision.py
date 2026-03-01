@@ -177,6 +177,14 @@ def _find_all_mobs_on_minimap(
     return mobs
 
 
+def count_mobs_on_minimap(
+    frame: np.ndarray,
+    min_dist: Optional[float] = None,
+) -> int:
+    """Return the number of mob dots visible on the minimap."""
+    return len(_find_all_mobs_on_minimap(frame, min_dist=min_dist))
+
+
 def has_mob_at_north(
     frame: np.ndarray,
     half_cone_deg: float = 30.0,

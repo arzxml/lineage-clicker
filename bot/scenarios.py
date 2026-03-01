@@ -43,7 +43,7 @@ class BotState(enum.Enum):
     MOVING = "moving"                           # walking toward a mob
     TARGETING_NEARBY_TARGET = "targeting_nearby_target"        # pressing next-target (up to 3 tries)
     TARGET_ACQUIRED = "target_acquired"          # target locked, buffs phase begins
-    PREPARING_TO_ATTACK = "applying_buffs"       # applying buffs
+    PREPARING_TO_ATTACK = "preparing_to_Attack"       # applying buffs
     READY_TO_ATTACK = "ready_to_attack"          # buffs done, next tick will attack
     ATTACKING = "attacking"                      # actively attacking a target
     TARGET_KILLED = "target_killed"              # target just died, ready to loot
@@ -185,19 +185,32 @@ class ScenarioRunner:
         self.xp_percent: float = 0.0
         self._last_stats_publish: float = 0.0   # throttle network broadcasts
 
-        # Availability is tracked for every skill in BUFF_SKILLS + COMBAT_SKILLS
+        # Availability is tracked for every skill in SKILL_CHAINS + COMBAT_SKILLS
         # (TOGGLE_SKILLS are always available and don't need tracking)
-        tracked_names = list(config.BUFF_SKILLS) + [
-            n for n in config.COMBAT_SKILLS if n not in config.BUFF_SKILLS
+        chain_skills: set[str] = set()
+        for chain_cfg in config.SKILL_CHAINS.values():
+            chain_skills.update(chain_cfg.get("skills", []))
+        tracked_names = list(chain_skills) + [
+            n for n in config.COMBAT_SKILLS if n not in chain_skills
         ]
         self.skill_availability: dict[str, dict] = {name: {} for name in tracked_names}
-        self.buff_skills_to_use: dict[str, dict] = config.BUFF_SKILLS
+        self.skill_chains: dict[str, dict] = config.SKILL_CHAINS
         self.combat_skills_to_use: dict[str, dict] = config.COMBAT_SKILLS
         self.toggle_skills_to_use: dict[str, dict] = config.TOGGLE_SKILLS
         # Track which toggle skills are currently active (on)
         self._toggle_active: dict[str, bool] = {name: False for name in config.TOGGLE_SKILLS}
 
         self._last_skill_check: float = 0.0             # throttle skill window opens
+
+        # ── Skill-chain state ─────────────────────────────────────
+        # Per-chain phase: "monitoring" | "waiting_hp" | "executing"
+        self._chain_phase: dict[str, str] = {
+            name: "monitoring" for name in config.SKILL_CHAINS
+        }
+        # True while any chain is in waiting_hp / executing.
+        # Suppresses engage_target re-presses and detect_target_death.
+        self._chain_active: bool = False
+        self._chain_stop_attack_time: float = 0.0
 
         # Cached hotbar positions: template_name → (cx, cy, tw, th)
         # Populated once at startup by _scan_hotbar() so we never need
@@ -277,16 +290,16 @@ class ScenarioRunner:
         cv2.matchTemplate every tick.
         """
         frame = self.capture.grab()
-        # Collect all template names we'll need: skills + items from buff actions
+        # Collect all template names we'll need: skills + items
         names: set[str] = set()
         for skill_name in self.skill_availability:
             names.add(f"skill-{skill_name}")
         for skill_name in self.toggle_skills_to_use:
             names.add(f"skill-{skill_name}")
-        # Items referenced in pre/post actions of buff skills
-        for cfg in self.buff_skills_to_use.values():
-            for action_key in ("pre", "post"):
-                item = cfg.get(action_key, {}).get("equip_item")
+        # Items referenced in preparation/cleanup actions of skill chains
+        for chain_cfg in self.skill_chains.values():
+            for action_key in ("preparation", "cleanup"):
+                item = chain_cfg.get(action_key, {}).get("equip_item")
                 if item:
                     names.add(f"item-{item}")
 
@@ -434,6 +447,9 @@ class ScenarioRunner:
         # While ATTACKING, periodically re-press attack key in case
         # auto-attack dropped (mob moved, lag, character interrupted, etc.)
         if self._state == BotState.ATTACKING:
+            # Suppress during skill-chain execution
+            if self._chain_active:
+                return
             interval = getattr(config, "ATTACK_REPRESS_INTERVAL", 3.0)
             now = _time.monotonic()
             if now - self._last_attack_press >= interval:
@@ -518,6 +534,10 @@ class ScenarioRunner:
         (UI decoration) keep the ratio non-zero.
         """
         if self._state != BotState.ATTACKING:
+            return
+
+        # Suppress during skill-chain execution (target may be deselected)
+        if self._chain_active:
             return
 
         has_tgt = vision.has_target(frame, matcher)
@@ -848,12 +868,6 @@ class ScenarioRunner:
                     log.debug(f"[skill:check] {skill_name} = UNAVAILABLE (below match threshold)")
             current[skill_name] = available
             self.skill_availability[skill_name]["available"] = available
-            if hit:
-                log.debug(
-                    f"[skill:check] {skill_name} = AVAILABLE (conf={hit[2]:.2f})"
-                )
-            else:
-                log.debug(f"[skill:check] {skill_name} = UNAVAILABLE (below match threshold)")
 
         changed = current != prev
         if changed:
@@ -871,78 +885,23 @@ class ScenarioRunner:
         bus: EventBus,
         event: Optional[dict] = None,
     ) -> None:
-        """Use buff skills after a target has been acquired.
+        """Transition from TARGET_ACQUIRED to ATTACKING.
 
-        Runs in TARGET_ACQUIRED state.  For each skill in
-        ``self.buff_skills_to_use``, checks availability and conditions,
-        executes pre-actions (e.g. equip item), uses the skill, then
-        executes post-actions.  Transitions to ATTACKING when done.
+        Individual buff skills have been replaced by SKILL_CHAINS which
+        fire during combat.  This scenario now just confirms the target
+        is alive and begins the attack.
         """
         if self._state != BotState.TARGET_ACQUIRED:
             return
 
-        _buff_t0 = _time.monotonic()
-        self._set_state(BotState.PREPARING_TO_ATTACK)
-
-        for skill_name, cfg in self.buff_skills_to_use.items():
-            # 1. Check availability
-            avail_info = self.skill_availability.get(skill_name, {})
-            if not avail_info.get("available", False):
-                log.debug(f"[buff:skip] {skill_name} – not available (cooldown or missing)")
-                continue
-
-            # 2. Evaluate conditions
-            conditions = cfg.get("conditions", {})
-            use_conditions = conditions.get("use", conditions)  # support nested {"use": {...}} or flat
-            if not self._check_buff_conditions(use_conditions):
-                log.debug(f"[buff:skip] {skill_name} – conditions not met ({use_conditions})")
-                continue
-
-            # 3. Execute pre-actions
-            pre = cfg.get("pre", {})
-            if pre:
-                log.debug(f"[buff:pre] {skill_name} – executing pre-action: {pre}")
-                self._execute_buff_action(pre, frame, matcher, ih)
-                sleep(0.2)
-
-            # 4. Use the skill – click cached position on the hot bar
-            template_name = f"skill-{skill_name}"
-            pos = self._hotbar_pos(template_name)
-            if pos:
-                log.info(f"[buff:use] clicking {skill_name} on hotbar (cached)")
-                self._click_hotbar(ih, pos[0], pos[1])
-            else:
-                # Fallback: runtime template match
-                fresh = self.capture.grab()
-                hit = matcher.find(
-                    fresh, template_name,
-                    region=config.REGION_SKILL_HOT_BAR,
-                )
-                if hit:
-                    log.info(f"[buff:use] clicking {skill_name} on hotbar (fallback conf={hit[2]:.2f})")
-                    self._click_hotbar(ih, hit[0], hit[1])
-                else:
-                    log.debug(f"[buff:fail] {skill_name} template not found on hotbar – skipping")
-                    continue
-
-            # 5. Execute post-actions
-            post = cfg.get("post", {})
-            if post:
-                log.debug(f"[buff:post] {skill_name} – executing post-action: {post}")
-                fresh = self.capture.grab()
-                self._execute_buff_action(post, fresh, matcher, ih)
-                sleep(0.2)
-
-        # Done – press attack immediately and go straight to ATTACKING.
-        # This avoids waiting for engage_target on the next tick.
         fresh = self.capture.grab()
         if vision.has_target(fresh, matcher) and vision.target_has_hp(fresh):
-            log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) – pressing attack → ATTACKING")
+            log.debug("[buff:done] target confirmed alive – pressing attack → ATTACKING")
             ih.press(config.KEY_ATTACK)
             self._last_attack_press = _time.monotonic()
             self._set_state(BotState.ATTACKING)
         else:
-            log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) → READY_TO_ATTACK")
+            log.debug("[buff:done] target lost or dead → READY_TO_ATTACK")
             self._set_state(BotState.READY_TO_ATTACK)
 
     def _check_buff_conditions(self, conditions: dict) -> bool:
@@ -1022,6 +981,179 @@ class ScenarioRunner:
                     self._click_hotbar(ih, hit[0], hit[1])
                 else:
                     log.warning(f"[equip:fail] template 'item-{equip}' not found on hotbar")
+
+    # ── Skill chains (ordered burst sequences) ────────────────────
+
+    async def execute_skill_chains(
+        self,
+        frame: np.ndarray,
+        matcher: TemplateMatcher,
+        ih: InputHandler,
+        bus: EventBus,
+        event: Optional[dict] = None,
+    ) -> None:
+        """Monitor and execute skill chains during combat.
+
+        A chain fires when ALL its skills are off cooldown, the bot is
+        ATTACKING, and safety conditions are met (mob count).  The chain
+        then optionally stops auto-attack, waits for HP to drop, equips
+        items, uses every skill in order, re-equips and resumes combat.
+        """
+        # If we left combat, reset any in-progress chain
+        if self._state != BotState.ATTACKING:
+            if self._chain_active:
+                log.debug("[chain:reset] left ATTACKING state – resetting chains")
+                for name in self._chain_phase:
+                    self._chain_phase[name] = "monitoring"
+                self._chain_active = False
+            return
+
+        for chain_name, chain_cfg in self.skill_chains.items():
+            phase = self._chain_phase.get(chain_name, "monitoring")
+
+            # ── MONITORING: wait for all skills to come off cooldown ──
+            if phase == "monitoring":
+                skills = chain_cfg.get("skills", [])
+                all_avail = all(
+                    self.skill_availability.get(s, {}).get("available", False)
+                    for s in skills
+                )
+                if not all_avail:
+                    continue
+
+                # Check safety: mob count
+                conditions = chain_cfg.get("conditions", {})
+                max_mobs = conditions.get("max_nearby_mobs", 999)
+                mob_count = vision.count_mobs_on_minimap(frame)
+                if mob_count > max_mobs:
+                    log.debug(
+                        f"[chain:{chain_name}] {mob_count} mobs on minimap "
+                        f"(max {max_mobs}) – too risky, skipping"
+                    )
+                    continue
+
+                prep = chain_cfg.get("preparation", {})
+                if prep.get("stop_attack"):
+                    # Press back-arrow to interrupt auto-attack while
+                    # keeping the target selected; mobs keep hitting us
+                    log.info(
+                        f"[chain:{chain_name}] all skills ready – "
+                        f"stepping back to stop attack and take damage"
+                    )
+                    ih.press(config.KEY_MOVE_BACK)
+                    self._chain_active = True
+                    self._chain_stop_attack_time = _time.monotonic()
+                    self._chain_phase[chain_name] = "waiting_hp"
+                else:
+                    # No HP-wait needed – execute immediately
+                    self._chain_active = True
+                    self._chain_phase[chain_name] = "executing"
+
+            # ── WAITING_HP: auto-attack is off, waiting for HP to drop ──
+            elif phase == "waiting_hp":
+                prep = chain_cfg.get("preparation", {})
+                hp_threshold = prep.get("wait_hp_below_percent", 0)
+                timeout = getattr(config, "CHAIN_HP_WAIT_TIMEOUT", 30.0)
+
+                hp_pct = (self.hp_current / self.hp_max * 100) if self.hp_max > 0 else 100
+
+                if hp_pct <= hp_threshold:
+                    log.info(
+                        f"[chain:{chain_name}] HP at {hp_pct:.0f}% "
+                        f"(≤ {hp_threshold}%) – executing chain"
+                    )
+                    self._chain_phase[chain_name] = "executing"
+                elif _time.monotonic() - self._chain_stop_attack_time > timeout:
+                    log.warning(
+                        f"[chain:{chain_name}] HP wait timed out after "
+                        f"{timeout:.0f}s – aborting, resuming attack"
+                    )
+                    self._chain_phase[chain_name] = "monitoring"
+                    self._chain_active = False
+                    # Resume attack (target still selected)
+                    ih.press(config.KEY_ATTACK)
+                    self._last_attack_press = _time.monotonic()
+                else:
+                    # Re-check mob count – if it increased, abort for safety
+                    conditions = chain_cfg.get("conditions", {})
+                    max_mobs = conditions.get("max_nearby_mobs", 999)
+                    mob_count = vision.count_mobs_on_minimap(frame)
+                    if mob_count > max_mobs:
+                        log.warning(
+                            f"[chain:{chain_name}] mob count rose to "
+                            f"{mob_count} during HP wait – aborting"
+                        )
+                        self._chain_phase[chain_name] = "monitoring"
+                        self._chain_active = False
+                        ih.press(config.KEY_ATTACK)
+                        self._last_attack_press = _time.monotonic()
+
+            # ── EXECUTING: run pre → skills → post → resume ──────────
+            if self._chain_phase.get(chain_name) == "executing":
+                self._execute_chain(chain_name, chain_cfg, frame, matcher, ih)
+                self._chain_phase[chain_name] = "monitoring"
+                self._chain_active = False
+
+    def _execute_chain(
+        self,
+        chain_name: str,
+        chain_cfg: dict,
+        frame: np.ndarray,
+        matcher: TemplateMatcher,
+        ih: InputHandler,
+    ) -> None:
+        """Run a complete skill chain: preparation → skills → cleanup → attack."""
+        _t0 = _time.monotonic()
+
+        # Preparation action (e.g. equip Knife)
+        # Target is still selected (we only stepped back, not deselected)
+        prep = chain_cfg.get("preparation", {})
+        prep_equip = {k: v for k, v in prep.items() if k == "equip_item"}
+        if prep_equip:
+            fresh = self.capture.grab()
+            self._execute_buff_action(prep_equip, fresh, matcher, ih)
+            sleep(0.2)
+
+        # Execute each skill in order
+        delay = chain_cfg.get("delay_between_skills", 0.3)
+        for skill_name in chain_cfg.get("skills", []):
+            template_name = f"skill-{skill_name}"
+            pos = self._hotbar_pos(template_name)
+            if pos:
+                log.info(f"[chain:{chain_name}] using {skill_name}")
+                self._click_hotbar(ih, pos[0], pos[1], post_delay=delay)
+            else:
+                # Fallback: runtime template match
+                fresh = self.capture.grab()
+                hit = matcher.find(
+                    fresh, template_name,
+                    region=config.REGION_SKILL_HOT_BAR,
+                )
+                if hit:
+                    log.info(f"[chain:{chain_name}] using {skill_name} (fallback)")
+                    self._click_hotbar(ih, hit[0], hit[1], post_delay=delay)
+                else:
+                    log.warning(
+                        f"[chain:{chain_name}] {skill_name} not found on hotbar – skipping"
+                    )
+            # Mark skill as on cooldown so the chain doesn't re-trigger
+            if skill_name in self.skill_availability:
+                self.skill_availability[skill_name]["available"] = False
+
+        # Cleanup action (e.g. equip Elven Long Sword)
+        cleanup = chain_cfg.get("cleanup", {})
+        if cleanup:
+            fresh = self.capture.grab()
+            self._execute_buff_action(cleanup, fresh, matcher, ih)
+            sleep(0.2)
+
+        # Resume attack
+        ih.press(config.KEY_ATTACK)
+        self._last_attack_press = _time.monotonic()
+        log.info(
+            f"[chain:{chain_name}] complete "
+            f"({(_time.monotonic() - _t0) * 1000:.0f}ms) – resuming attack"
+        )
 
     # ── OCR-based stat reading (moved to StatsReader background thread) ──
 
@@ -1151,6 +1283,9 @@ class ScenarioRunner:
         """
         if not self.toggle_skills_to_use:
             return
+        # Only toggle skills when out of combat (before/between fights)
+        if self._state != BotState.IDLE:
+            return
         # Only manage toggles when we have stats (mp_max > 0)
         if self.mp_max <= 0:
             return
@@ -1231,6 +1366,7 @@ class ScenarioRunner:
             "scan_skill_cooldowns": self.scan_skill_cooldowns,
             "apply_buffs": self.apply_buffs,
             "update_toggle_skills": self.update_toggle_skills,
+            "execute_skill_chains": self.execute_skill_chains,
             "walk_to_mob": self.walk_to_mob,
             "calibrate_camera": self.calibrate_camera,
             "stop_on_exit_menu": self.stop_on_exit_menu,

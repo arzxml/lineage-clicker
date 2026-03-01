@@ -39,6 +39,7 @@ ACTIVE_SCENARIOS: list[str] = [
     "scan_skill_cooldowns",
     "apply_buffs",
     "update_toggle_skills",
+    "execute_skill_chains",
     "detect_target_death",
     "loot_target",
     "scan_nearby_mobs",
@@ -68,6 +69,7 @@ KEY_LOOT   = "f4"
 KEY_TARGET_PPL = "f12"
 KEY_ASSIST = "f11"
 KEY_NEXT_TARGET = "f10"
+KEY_MOVE_BACK   = "down"      # back-arrow: step backward (cancels auto-attack without deselecting)
 
 # Looting
 LOOT_PRESS_COUNT = 10     # number of F4 presses per loot sequence
@@ -115,31 +117,48 @@ TOGGLE_SKILLS: dict[str, dict] = {
                 }
             },
             "pre":  {},
-            "post": {},
+            "cleanup": {},
     }
 }
 
-# Buff skills to auto-use when conditions are met.
-# Each entry: conditions (when to use), pre/post actions (equip swaps, etc.).
-# All keys from BUFF_SKILLS and COMBAT_SKILLS are automatically tracked
-# for availability on the hot bar.
-BUFF_SKILLS: dict[str, dict] = {
-    # Skills for destroyer
-    "Rage": {
-        "conditions": {},
-        "pre":  {"equip_item": "Knife"},
-        "post": {"equip_item": "Elven Long Sword"},
-    },
-    "Frenzy": {
+# Skill chains – ordered sequences of skills used together.
+# Each chain has:
+#   skills:  list[str]        – skill names in execution order
+#   conditions:  dict         – when the chain is allowed to fire
+#     max_nearby_mobs: int    – abort if more mobs than this on minimap
+#   preparation:  dict        – steps before executing skills
+#     stop_attack: bool       – step backward to stop auto-attack
+#     wait_hp_below_percent: int – wait for HP to drop to this %
+#     equip_item: str         – equip this item before using skills
+#   cleanup: dict             – steps after all skills have been used
+#     equip_item: str         – re-equip main weapon
+#   delay_between_skills: float – seconds between each skill click
+#
+# The chain fires once ALL listed skills are off cooldown.
+# After execution every skill enters cooldown so the chain
+# won't re-trigger until they're all available again.
+SKILL_CHAINS: dict[str, dict] = {
+    "destroyer_burst": {
+        "skills": ["Rage", "Frenzy", "Battle Roar"],
         "conditions": {
-            "use": {
-                "hp_below_percent": 30
-            }
+            "max_nearby_mobs": 3,
         },
-        "pre":  {"equip_item": "Knife"},
-        "post": {"equip_item": "Elven Long Sword"},
+        "preparation": {
+            "stop_attack": True,
+            "wait_hp_below_percent": 30,
+            "equip_item": "Knife",
+        },
+        "cleanup": {
+            "equip_item": "Elven Long Sword"
+        },
+        "delay_between_skills": 0.3,
     },
 }
+
+# Safety timeout (seconds) for the HP-wait phase of a skill chain.
+# If HP doesn't drop to the target within this time, the chain aborts
+# and normal combat resumes.
+CHAIN_HP_WAIT_TIMEOUT = 30.0
 
 # Patrol zone
 PATROL_CHECK_INTERVAL = 30.0    # seconds between map checks
