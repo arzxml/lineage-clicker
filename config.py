@@ -145,10 +145,12 @@ SKILL_CHAINS: dict[str, dict] = {
         },
         "preparation": {
             "stop_attack": True,
-            "equip_item": "Knife",
             "wait_hp_below_percent": 30,
         },
-        "cleanup": {
+        "before": {
+            "equip_item": "Knife",
+        },
+        "after": {
             "equip_item": "Elven Long Sword"
         },
         "delay_between_skills": 0.3,

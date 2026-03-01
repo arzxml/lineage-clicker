@@ -301,9 +301,9 @@ class ScenarioRunner:
             names.add(f"skill-{skill_name}")
         for skill_name in self.toggle_skills_to_use:
             names.add(f"skill-{skill_name}")
-        # Items referenced in preparation/cleanup actions of skill chains
+        # Items referenced in before/after actions of skill chains
         for chain_cfg in self.skill_chains.values():
-            for action_key in ("preparation", "cleanup"):
+            for action_key in ("before", "after"):
                 item = chain_cfg.get(action_key, {}).get("equip_item")
                 if item:
                     names.add(f"item-{item}")
@@ -1059,12 +1059,11 @@ class ScenarioRunner:
                     ih.press(config.KEY_MOVE_BACK)
                     sleep(0.5)  # let the character fully stop
 
-                    # Equip item (e.g. Knife) while character is idle,
-                    # before we start waiting for HP to drop.
-                    prep_equip = {k: v for k, v in prep.items() if k == "equip_item"}
-                    if prep_equip:
+                    # Execute 'before' actions (e.g. equip Knife)
+                    before = chain_cfg.get("before", {})
+                    if before:
                         fresh = self.capture.grab()
-                        self._execute_buff_action(prep_equip, fresh, matcher, ih)
+                        self._execute_buff_action(before, fresh, matcher, ih)
                         sleep(0.2)
 
                     self._chain_active = True
@@ -1094,6 +1093,12 @@ class ScenarioRunner:
                         f"[chain:{chain_name}] HP wait timed out after "
                         f"{timeout:.0f}s – aborting, resuming attack"
                     )
+                    # Re-equip original weapon before resuming
+                    after = chain_cfg.get("after", {})
+                    if after:
+                        fresh = self.capture.grab()
+                        self._execute_buff_action(after, fresh, matcher, ih)
+                        sleep(0.2)
                     self._chain_phase[chain_name] = "monitoring"
                     self._chain_active = False
                     # Resume attack (target still selected)
@@ -1112,17 +1117,26 @@ class ScenarioRunner:
                             f"[chain:{chain_name}] mob count rose to "
                             f"{mob_count} during HP wait – aborting"
                         )
+                        # Re-equip original weapon before resuming
+                        after = chain_cfg.get("after", {})
+                        if after:
+                            fresh_c = self.capture.grab()
+                            self._execute_buff_action(after, fresh_c, matcher, ih)
+                            sleep(0.2)
                         self._chain_phase[chain_name] = "monitoring"
                         self._chain_active = False
                         ih.press(config.KEY_ATTACK)
                         self._last_attack_press = _time.monotonic()
                         self._chain_combat_start = _time.monotonic()
 
-            # ── EXECUTING: run pre → skills → post → resume ──────────
+            # ── EXECUTING: run skills → after → resume ──────────
             if self._chain_phase.get(chain_name) == "executing":
                 self._execute_chain(chain_name, chain_cfg, frame, matcher, ih)
                 self._chain_phase[chain_name] = "monitoring"
                 self._chain_active = False
+                # Reset combat timer so chain won't retrigger for
+                # at least CHAIN_MIN_COMBAT_SECS.
+                self._chain_combat_start = _time.monotonic()
 
     def _execute_chain(
         self,
@@ -1132,10 +1146,10 @@ class ScenarioRunner:
         matcher: TemplateMatcher,
         ih: InputHandler,
     ) -> None:
-        """Run a complete skill chain: skills → cleanup → attack.
+        """Run a complete skill chain: skills → after → attack.
 
-        Preparation (stop attack, equip) has already been handled by the
-        MONITORING phase before entering EXECUTING.
+        Preparation (stop attack, before actions) has already been
+        handled by the MONITORING phase before entering EXECUTING.
         """
         _t0 = _time.monotonic()
 
@@ -1170,11 +1184,11 @@ class ScenarioRunner:
             if skill_name in self.skill_availability:
                 self.skill_availability[skill_name]["available"] = False
 
-        # Cleanup action (e.g. equip Elven Long Sword)
-        cleanup = chain_cfg.get("cleanup", {})
-        if cleanup:
+        # 'after' action (e.g. equip Elven Long Sword)
+        after = chain_cfg.get("after", {})
+        if after:
             fresh = self.capture.grab()
-            self._execute_buff_action(cleanup, fresh, matcher, ih)
+            self._execute_buff_action(after, fresh, matcher, ih)
             sleep(0.2)
 
         # Resume attack
