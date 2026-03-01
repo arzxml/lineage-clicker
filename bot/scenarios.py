@@ -1059,13 +1059,6 @@ class ScenarioRunner:
                     ih.press(config.KEY_MOVE_BACK)
                     sleep(0.5)  # let the character fully stop
 
-                    # Execute 'before' actions (e.g. equip Knife)
-                    before = chain_cfg.get("before", {})
-                    if before:
-                        fresh = self.capture.grab()
-                        self._execute_buff_action(before, fresh, matcher, ih)
-                        sleep(0.2)
-
                     self._chain_active = True
                     self._chain_stop_attack_time = _time.monotonic()
                     self._chain_phase[chain_name] = "waiting_hp"
@@ -1093,12 +1086,6 @@ class ScenarioRunner:
                         f"[chain:{chain_name}] HP wait timed out after "
                         f"{timeout:.0f}s – aborting, resuming attack"
                     )
-                    # Re-equip original weapon before resuming
-                    after = chain_cfg.get("after", {})
-                    if after:
-                        fresh = self.capture.grab()
-                        self._execute_buff_action(after, fresh, matcher, ih)
-                        sleep(0.2)
                     self._chain_phase[chain_name] = "monitoring"
                     self._chain_active = False
                     # Resume attack (target still selected)
@@ -1117,12 +1104,6 @@ class ScenarioRunner:
                             f"[chain:{chain_name}] mob count rose to "
                             f"{mob_count} during HP wait – aborting"
                         )
-                        # Re-equip original weapon before resuming
-                        after = chain_cfg.get("after", {})
-                        if after:
-                            fresh_c = self.capture.grab()
-                            self._execute_buff_action(after, fresh_c, matcher, ih)
-                            sleep(0.2)
                         self._chain_phase[chain_name] = "monitoring"
                         self._chain_active = False
                         ih.press(config.KEY_ATTACK)
@@ -1146,10 +1127,9 @@ class ScenarioRunner:
         matcher: TemplateMatcher,
         ih: InputHandler,
     ) -> None:
-        """Run a complete skill chain: skills → after → attack.
+        """Run a complete skill chain: before → skills → after → attack.
 
-        Preparation (stop attack, before actions) has already been
-        handled by the MONITORING phase before entering EXECUTING.
+        Preparation (stop attack, HP wait) has already completed.
         """
         _t0 = _time.monotonic()
 
@@ -1158,24 +1138,32 @@ class ScenarioRunner:
         ih.press(config.KEY_MOVE_BACK)
         sleep(0.5)
 
-        # Execute each skill in order
+        # Execute 'before' actions (e.g. equip Knife)
+        before = chain_cfg.get("before", {})
+        if before:
+            fresh = self.capture.grab()
+            self._execute_buff_action(before, fresh, matcher, ih)
+            sleep(0.2)
+
+        # Execute each skill in order using fresh template matching
+        # (not the startup cache – hotbar may look different mid-chain)
         delay = chain_cfg.get("delay_between_skills", 0.3)
         for skill_name in chain_cfg.get("skills", []):
             template_name = f"skill-{skill_name}"
-            pos = self._hotbar_pos(template_name)
-            if pos:
-                log.info(f"[chain:{chain_name}] using {skill_name}")
-                self._click_hotbar(ih, pos[0], pos[1], post_delay=delay)
+            fresh = self.capture.grab()
+            hit = matcher.find(
+                fresh, template_name,
+                region=config.REGION_SKILL_HOT_BAR,
+            )
+            if hit:
+                log.info(f"[chain:{chain_name}] using {skill_name} at ({hit[0]}, {hit[1]}) conf={hit[2]:.2f}")
+                self._click_hotbar(ih, hit[0], hit[1], post_delay=delay)
             else:
-                # Fallback: runtime template match
-                fresh = self.capture.grab()
-                hit = matcher.find(
-                    fresh, template_name,
-                    region=config.REGION_SKILL_HOT_BAR,
-                )
-                if hit:
-                    log.info(f"[chain:{chain_name}] using {skill_name} (fallback)")
-                    self._click_hotbar(ih, hit[0], hit[1], post_delay=delay)
+                # Fallback: try the cached position
+                pos = self._hotbar_pos(template_name)
+                if pos:
+                    log.info(f"[chain:{chain_name}] using {skill_name} (cached fallback)")
+                    self._click_hotbar(ih, pos[0], pos[1], post_delay=delay)
                 else:
                     log.warning(
                         f"[chain:{chain_name}] {skill_name} not found on hotbar – skipping"

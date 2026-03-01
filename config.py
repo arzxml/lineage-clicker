@@ -153,7 +153,7 @@ SKILL_CHAINS: dict[str, dict] = {
         "after": {
             "equip_item": "Elven Long Sword"
         },
-        "delay_between_skills": 0.3,
+        "delay_between_skills": 1,
     },
 }
 
