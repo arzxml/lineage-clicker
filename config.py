@@ -163,6 +163,12 @@ SKILL_CHAINS: dict[str, dict] = {
             "max_nearby_mobs": 3,
             "require_unavailable": ["Frenzy"],  # only when Frenzy is on cooldown
         },
+        "before": {
+            "equip_item": "Knife",
+        },
+        "after": {
+            "equip_item": "Elven Long Sword"
+        },
         "delay_between_skills": 0.3,
     },
 }
