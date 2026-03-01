@@ -72,6 +72,8 @@ KEY_NEXT_TARGET = "f10"
 # Looting
 LOOT_PRESS_COUNT = 10     # number of F4 presses per loot sequence
 LOOT_PRESS_DELAY = 0.05   # seconds between loot presses
+LOOT_START_DELAY = 0.6    # seconds to wait after kill before first pickup press (death animation)
+LOOT_SECOND_BURST_DELAY = 0.5  # pause before 2nd burst of pickup presses (late-dropping items)
 
 # Movement
 MOVE_CLICK_RADIUS = 700   # how far (px) from screen center to click when walking (directional)

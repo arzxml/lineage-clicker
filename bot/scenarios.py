@@ -511,18 +511,43 @@ class ScenarioRunner:
             self._set_state(BotState.LOOTING_DONE)
 
     def _do_loot(self, ih: InputHandler, matcher: Optional[TemplateMatcher] = None) -> None:
-        """Press loot key several times then cancel target."""
+        """Wait for loot to spawn, then press loot key in two bursts.
+
+        Burst 1 – picks up items that dropped immediately.
+        Burst 2 – catches late-spawning items (quest drops, adena
+        sometimes appears with a slight delay).
+        """
         _loot_t0 = _time.monotonic()
         press_count = getattr(config, "LOOT_PRESS_COUNT", 10)
         press_delay = getattr(config, "LOOT_PRESS_DELAY", 0.05)
-        for i in range(press_count):
+        start_delay = getattr(config, "LOOT_START_DELAY", 0.6)
+        burst2_delay = getattr(config, "LOOT_SECOND_BURST_DELAY", 0.5)
+
+        # Wait for death animation / loot spawn
+        log.debug(f"[loot:wait] waiting {start_delay:.1f}s for loot to spawn")
+        sleep(start_delay)
+
+        # Burst 1
+        half = press_count // 2 or 1
+        for i in range(half):
             ih.press(config.KEY_LOOT)
             sleep(press_delay)
             if matcher is not None:
                 self._check_exit(matcher)
+
+        # Pause to let late items drop
+        sleep(burst2_delay)
+
+        # Burst 2
+        for i in range(press_count - half):
+            ih.press(config.KEY_LOOT)
+            sleep(press_delay)
+            if matcher is not None:
+                self._check_exit(matcher)
+
         self._cancel_target(ih)
         sleep(0.1)
-        log.debug(f"[loot:done] loot sequence finished ({(_time.monotonic()-_loot_t0)*1000:.0f}ms, {press_count} presses + cancel)")
+        log.debug(f"[loot:done] loot sequence finished ({(_time.monotonic()-_loot_t0)*1000:.0f}ms, {press_count} presses in 2 bursts + cancel)")
 
     async def pre_orient_camera(
         self,
