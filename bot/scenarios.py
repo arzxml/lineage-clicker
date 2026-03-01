@@ -199,6 +199,11 @@ class ScenarioRunner:
 
         self._last_skill_check: float = 0.0             # throttle skill window opens
 
+        # Cached hotbar positions: template_name → (cx, cy, tw, th)
+        # Populated once at startup by _scan_hotbar() so we never need
+        # runtime template matching on the hot bar.
+        self._hotbar_cache: dict[str, tuple[int, int, int, int]] = {}
+
         # Target HP stall detection – if HP ratio hasn't changed for
         # several seconds while ATTACKING, the mob is likely dead and
         # we're seeing residual red UI decoration.
@@ -238,15 +243,89 @@ class ScenarioRunner:
     #  SCENARIOS
     # ─────────────────────────────────────────────────────────────────
 
+    def _click_hotbar(self, ih: InputHandler, x: int, y: int, post_delay: float = 0.3) -> None:
+        """Click a hotbar icon and immediately move the cursor away.
+
+        Tooltip popups on hover can obscure neighbouring skill/item
+        icons, breaking subsequent template matches.  Moving the
+        cursor to the screen centre clears the tooltip.
+        """
+        ih.click(x, y)
+        # Park cursor at screen centre (well away from the hotbar)
+        mon = self.capture.monitor
+        ih.move_to(mon["left"] + mon["width"] // 2,
+                   mon["top"] + mon["height"] // 2)
+        sleep(post_delay)
+
     def _cancel_target(self, ih: InputHandler) -> None:
         """Cancel current target by pressing Escape."""
         ih.press("esc")
 
-    def initialize(self, ih: InputHandler) -> None:
-        """One-time setup: reset camera to top-down view."""
+    def initialize(self, ih: InputHandler, matcher: TemplateMatcher | None = None) -> None:
+        """One-time setup: scan hotbar positions and reset camera."""
         if not self._initialized:
-            log.info("[init:setup] one-time camera initialisation")
+            log.info("[init:setup] one-time initialisation")
+            if matcher is not None:
+                self._scan_hotbar(matcher)
             self._initialized = True
+
+    def _scan_hotbar(self, matcher: TemplateMatcher) -> None:
+        """Locate every skill / item icon on the hotbar and cache positions.
+
+        Called once at bot startup.  The cached (cx, cy, tw, th) tuples
+        are used by all subsequent hotbar interactions instead of running
+        cv2.matchTemplate every tick.
+        """
+        frame = self.capture.grab()
+        # Collect all template names we'll need: skills + items from buff actions
+        names: set[str] = set()
+        for skill_name in self.skill_availability:
+            names.add(f"skill-{skill_name}")
+        for skill_name in self.toggle_skills_to_use:
+            names.add(f"skill-{skill_name}")
+        # Items referenced in pre/post actions of buff skills
+        for cfg in self.buff_skills_to_use.values():
+            for action_key in ("pre", "post"):
+                item = cfg.get(action_key, {}).get("equip_item")
+                if item:
+                    names.add(f"item-{item}")
+
+        found = 0
+        for tpl_name in sorted(names):
+            hit = matcher.find(
+                frame, tpl_name,
+                region=config.REGION_SKILL_HOT_BAR,
+            )
+            if hit is None:
+                log.warning(f"[hotbar:cache] {tpl_name} NOT found on hotbar")
+                continue
+            tpl_img = matcher.get_template(tpl_name)
+            th, tw = tpl_img.shape[:2] if tpl_img is not None else (0, 0)
+            self._hotbar_cache[tpl_name] = (hit[0], hit[1], tw, th)
+            log.info(
+                f"[hotbar:cache] {tpl_name} cached at ({hit[0]}, {hit[1]}) "
+                f"size {tw}x{th} conf={hit[2]:.2f}"
+            )
+            found += 1
+
+        log.info(f"[hotbar:cache] cached {found}/{len(names)} hotbar icons")
+
+    def _hotbar_pos(self, template_name: str) -> tuple[int, int] | None:
+        """Return (cx, cy) from cache, or None if not cached."""
+        entry = self._hotbar_cache.get(template_name)
+        return (entry[0], entry[1]) if entry else None
+
+    def _hotbar_crop(self, frame: np.ndarray, template_name: str) -> np.ndarray | None:
+        """Crop the frame at the cached hotbar position (same size as template)."""
+        entry = self._hotbar_cache.get(template_name)
+        if entry is None:
+            return None
+        cx, cy, tw, th = entry
+        x1 = max(0, cx - tw // 2)
+        y1 = max(0, cy - th // 2)
+        x2 = min(frame.shape[1], x1 + tw)
+        y2 = min(frame.shape[0], y1 + th)
+        return frame[y1:y2, x1:x2]
 
     # ── Scenario methods ─────────────────────────────────────────
 
@@ -714,36 +793,59 @@ class ScenarioRunner:
 
         for skill_name in self.skill_availability:
             template_name = f"skill-{skill_name}"
-            hit = matcher.find(
-                frame,
-                template_name,
-                region=config.REGION_SKILL_HOT_BAR,
-            )
+            cached_pos = self._hotbar_pos(template_name)
 
-            # Even if shape matches, check brightness to detect cooldown
-            if hit is not None:
+            # Use cached position for brightness check (skip template matching)
+            if cached_pos is not None:
                 tpl_img = matcher.get_template(template_name)
                 if tpl_img is not None:
-                    cx, cy, conf = hit
-                    th, tw = tpl_img.shape[:2]
-                    # Extract matched region from full frame
-                    x1 = max(0, cx - tw // 2)
-                    y1 = max(0, cy - th // 2)
-                    x2 = min(frame.shape[1], x1 + tw)
-                    y2 = min(frame.shape[0], y1 + th)
-                    region_crop = frame[y1:y2, x1:x2]
-                    # Compare mean brightness (V channel in HSV)
+                    region_crop = self._hotbar_crop(frame, template_name)
                     tpl_brightness = cv2.cvtColor(tpl_img, cv2.COLOR_BGR2GRAY).mean()
                     region_brightness = cv2.cvtColor(region_crop, cv2.COLOR_BGR2GRAY).mean()
                     b_ratio = region_brightness / tpl_brightness if tpl_brightness > 0 else 1.0
-                    if b_ratio < brightness_ratio:
+                    available = b_ratio >= brightness_ratio
+                    if not available:
                         log.debug(
                             f"[skill:check] {skill_name} = UNAVAILABLE "
                             f"(darkened: brightness {b_ratio:.2f} < {brightness_ratio})"
                         )
-                        hit = None  # reject — skill is on cooldown
+                    else:
+                        log.debug(f"[skill:check] {skill_name} = AVAILABLE (brightness {b_ratio:.2f})")
+                else:
+                    available = True  # no template image to compare — assume available
+            else:
+                # Fallback: not cached, use runtime template match
+                hit = matcher.find(
+                    frame,
+                    template_name,
+                    region=config.REGION_SKILL_HOT_BAR,
+                )
 
-            available = hit is not None
+                if hit is not None:
+                    tpl_img = matcher.get_template(template_name)
+                    if tpl_img is not None:
+                        cx, cy, conf = hit
+                        th, tw = tpl_img.shape[:2]
+                        x1 = max(0, cx - tw // 2)
+                        y1 = max(0, cy - th // 2)
+                        x2 = min(frame.shape[1], x1 + tw)
+                        y2 = min(frame.shape[0], y1 + th)
+                        region_crop = frame[y1:y2, x1:x2]
+                        tpl_brightness = cv2.cvtColor(tpl_img, cv2.COLOR_BGR2GRAY).mean()
+                        region_brightness = cv2.cvtColor(region_crop, cv2.COLOR_BGR2GRAY).mean()
+                        b_ratio = region_brightness / tpl_brightness if tpl_brightness > 0 else 1.0
+                        if b_ratio < brightness_ratio:
+                            log.debug(
+                                f"[skill:check] {skill_name} = UNAVAILABLE "
+                                f"(darkened: brightness {b_ratio:.2f} < {brightness_ratio})"
+                            )
+                            hit = None
+
+                available = hit is not None
+                if available:
+                    log.debug(f"[skill:check] {skill_name} = AVAILABLE (fallback match)")
+                else:
+                    log.debug(f"[skill:check] {skill_name} = UNAVAILABLE (below match threshold)")
             current[skill_name] = available
             self.skill_availability[skill_name]["available"] = available
             if hit:
@@ -803,20 +905,25 @@ class ScenarioRunner:
                 self._execute_buff_action(pre, frame, matcher, ih)
                 sleep(0.2)
 
-            # 4. Use the skill – find and click it on the hot bar
+            # 4. Use the skill – click cached position on the hot bar
             template_name = f"skill-{skill_name}"
-            fresh = self.capture.grab()
-            hit = matcher.find(
-                fresh, template_name,
-                region=config.REGION_SKILL_HOT_BAR,
-            )
-            if hit:
-                log.info(f"[buff:use] clicking {skill_name} on hotbar (conf={hit[2]:.2f})")
-                ih.click(hit[0], hit[1])
-                sleep(0.3)
+            pos = self._hotbar_pos(template_name)
+            if pos:
+                log.info(f"[buff:use] clicking {skill_name} on hotbar (cached)")
+                self._click_hotbar(ih, pos[0], pos[1])
             else:
-                log.debug(f"[buff:fail] {skill_name} template not found on hotbar – skipping")
-                continue
+                # Fallback: runtime template match
+                fresh = self.capture.grab()
+                hit = matcher.find(
+                    fresh, template_name,
+                    region=config.REGION_SKILL_HOT_BAR,
+                )
+                if hit:
+                    log.info(f"[buff:use] clicking {skill_name} on hotbar (fallback conf={hit[2]:.2f})")
+                    self._click_hotbar(ih, hit[0], hit[1])
+                else:
+                    log.debug(f"[buff:fail] {skill_name} template not found on hotbar – skipping")
+                    continue
 
             # 5. Execute post-actions
             post = cfg.get("post", {})
@@ -900,16 +1007,21 @@ class ScenarioRunner:
         equip = action.get("equip_item")
         if equip:
             template_name = f"item-{equip}"
-            hit = matcher.find(
-                frame, template_name,
-                region=config.REGION_SKILL_HOT_BAR,
-            )
-            if hit:
-                log.info(f"[equip:click] equipping '{equip}' (conf={hit[2]:.2f})")
-                ih.click(hit[0], hit[1])
-                sleep(0.3)
+            pos = self._hotbar_pos(template_name)
+            if pos:
+                log.info(f"[equip:click] equipping '{equip}' (cached)")
+                self._click_hotbar(ih, pos[0], pos[1])
             else:
-                log.warning(f"[equip:fail] template 'item-{equip}' not found on hotbar")
+                # Fallback: runtime template match
+                hit = matcher.find(
+                    frame, template_name,
+                    region=config.REGION_SKILL_HOT_BAR,
+                )
+                if hit:
+                    log.info(f"[equip:click] equipping '{equip}' (fallback conf={hit[2]:.2f})")
+                    self._click_hotbar(ih, hit[0], hit[1])
+                else:
+                    log.warning(f"[equip:fail] template 'item-{equip}' not found on hotbar")
 
     # ── OCR-based stat reading (moved to StatsReader background thread) ──
 
@@ -1059,36 +1171,48 @@ class ScenarioRunner:
                 should_enable = self._check_buff_conditions(enable_conditions)
                 if should_enable:
                     template_name = f"skill-{skill_name}"
-                    fresh = self.capture.grab()
-                    hit = matcher.find(
-                        fresh, template_name,
-                        region=config.REGION_SKILL_HOT_BAR,
-                    )
-                    if hit:
-                        log.info(f"[toggle:on] enabling {skill_name} (conf={hit[2]:.2f})")
-                        ih.click(hit[0], hit[1])
+                    pos = self._hotbar_pos(template_name)
+                    if pos:
+                        log.info(f"[toggle:on] enabling {skill_name} (cached)")
+                        self._click_hotbar(ih, pos[0], pos[1])
                         self._toggle_active[skill_name] = True
-                        sleep(0.3)
                     else:
-                        log.debug(f"[toggle:on] {skill_name} template not found on hotbar")
+                        # Fallback: runtime template match
+                        fresh = self.capture.grab()
+                        hit = matcher.find(
+                            fresh, template_name,
+                            region=config.REGION_SKILL_HOT_BAR,
+                        )
+                        if hit:
+                            log.info(f"[toggle:on] enabling {skill_name} (fallback conf={hit[2]:.2f})")
+                            self._click_hotbar(ih, hit[0], hit[1])
+                            self._toggle_active[skill_name] = True
+                        else:
+                            log.debug(f"[toggle:on] {skill_name} template not found on hotbar")
 
             elif is_active and disable_conditions:
                 # Check if we should turn OFF
                 should_disable = self._check_buff_conditions(disable_conditions)
                 if should_disable:
                     template_name = f"skill-{skill_name}"
-                    fresh = self.capture.grab()
-                    hit = matcher.find(
-                        fresh, template_name,
-                        region=config.REGION_SKILL_HOT_BAR,
-                    )
-                    if hit:
-                        log.info(f"[toggle:off] disabling {skill_name} (conf={hit[2]:.2f})")
-                        ih.click(hit[0], hit[1])
+                    pos = self._hotbar_pos(template_name)
+                    if pos:
+                        log.info(f"[toggle:off] disabling {skill_name} (cached)")
+                        self._click_hotbar(ih, pos[0], pos[1])
                         self._toggle_active[skill_name] = False
-                        sleep(0.3)
                     else:
-                        log.debug(f"[toggle:off] {skill_name} template not found on hotbar")
+                        # Fallback: runtime template match
+                        fresh = self.capture.grab()
+                        hit = matcher.find(
+                            fresh, template_name,
+                            region=config.REGION_SKILL_HOT_BAR,
+                        )
+                        if hit:
+                            log.info(f"[toggle:off] disabling {skill_name} (fallback conf={hit[2]:.2f})")
+                            self._click_hotbar(ih, hit[0], hit[1])
+                            self._toggle_active[skill_name] = False
+                        else:
+                            log.debug(f"[toggle:off] {skill_name} template not found on hotbar")
 
     def get_scenarios(self, names: list[str]) -> list:
         """Return a list of bound methods for the given scenario names."""

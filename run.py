@@ -197,7 +197,7 @@ async def bot_loop(
     await asyncio.sleep(0.1)
 
     # One-time camera setup
-    scenarios.initialize(ih)
+    scenarios.initialize(ih, matcher)
 
     active_scenarios = scenarios.get_scenarios(config.ACTIVE_SCENARIOS)
 
