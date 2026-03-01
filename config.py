@@ -20,6 +20,11 @@ MONITOR_INDEX = 1
 # How many times per second we capture the screen
 CAPTURE_FPS = 5
 
+# How often the background OCR thread reads stats (seconds).
+# OCR takes ~2.8 s on CPU, so it runs on a separate thread to
+# keep the main bot loop fast.
+OCR_INTERVAL = 5.0
+
 # ── Template matching ─────────────────────────
 # Minimum confidence (0–1) for a template match to be accepted
 MATCH_THRESHOLD = 0.80
@@ -31,7 +36,6 @@ TEMPLATES_DIR = "assets/templates"
 # (populated in bot/scenarios.py)
 ACTIVE_SCENARIOS: list[str] = [
     "process_remote_events",
-    "read_stats_ocr",
     "scan_skill_cooldowns",
     "apply_buffs",
     "update_toggle_skills",

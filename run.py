@@ -27,7 +27,7 @@ from bot.input_handler import InputHandler
 from bot.network.event_bus import EventBus
 from bot.network.server import NetworkServer
 from bot.network.client import NetworkClient
-from bot.scenarios import ScenarioRunner, BotStopRequested
+from bot.scenarios import ScenarioRunner, BotStopRequested, StatsReader
 from bot.network.remote_state import RemoteStateStore
 
 logging.basicConfig(
@@ -210,6 +210,9 @@ async def bot_loop(
     scenarios._exit_event = exit_watcher._exit_event
     exit_watcher.start()
 
+    stats_reader = StatsReader(scenarios)
+    stats_reader.start()
+
     try:
         while True:
             tick_start = time.monotonic()
@@ -245,6 +248,11 @@ async def bot_loop(
                 except Exception as exc:
                     log.exception(f"[bot:error] scenario {scenario_fn.__name__}: {exc}")
 
+            # Publish stats event from background OCR thread
+            stats_ev = stats_reader.drain_event()
+            if stats_ev is not None:
+                await bus.publish(stats_ev)
+
             # Forward locally-published events to the other PC
             while not bus._queue.empty():
                 local_event = await bus.next_event()
@@ -259,6 +267,7 @@ async def bot_loop(
                 log.debug(f"[tick:total] {tick_ms:.0f}ms (state={scenarios._state.value})")
             await asyncio.sleep(max(0.0, interval - elapsed))
     finally:
+        stats_reader.stop()
         exit_watcher.stop()
 
 

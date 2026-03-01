@@ -19,6 +19,7 @@ from __future__ import annotations
 import enum
 import logging
 import math
+import threading
 import time as _time
 from time import sleep
 from typing import Optional
@@ -54,6 +55,112 @@ class BotStopRequested(Exception):
     """Raised by a scenario to signal the bot loop should exit."""
 
 
+# ─────────────────────────────────────────────────────────────────────
+#  Background OCR stats reader
+# ─────────────────────────────────────────────────────────────────────
+
+class StatsReader:
+    """Reads character stats via OCR on a background daemon thread.
+
+    Results are written directly to the :class:`ScenarioRunner` fields
+    (CP, HP, MP, XP, level).  Simple attribute assignments are
+    thread-safe under CPython's GIL.
+
+    Call :meth:`start` after creating the runner, :meth:`stop` to
+    shut down cleanly.
+    """
+
+    def __init__(
+        self,
+        runner: "ScenarioRunner",
+        interval: float | None = None,
+    ) -> None:
+        self._runner = runner
+        self._interval = interval or getattr(config, "OCR_INTERVAL", 5.0)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="stats-reader", daemon=True,
+        )
+        # Pending bus event to be published by the main loop
+        self._pending_event: dict | None = None
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def drain_event(self) -> dict | None:
+        """Pop the latest stats event (called from the main loop)."""
+        ev = self._pending_event
+        self._pending_event = None
+        return ev
+
+    # -- internal --------------------------------------------------
+
+    def _run(self) -> None:
+        capture = ScreenCapture()
+        while not self._stop_event.is_set():
+            try:
+                frame = capture.grab()
+                reading = ocr.read_stats(frame)
+                if reading is not None:
+                    self._apply(reading)
+            except Exception:
+                log.exception("[stats-reader] error during OCR")
+            self._stop_event.wait(self._interval)
+
+    def _apply(self, reading) -> None:
+        """Apply an OCR reading to the runner, with validation."""
+        r = self._runner
+
+        level = reading.level if reading.level > 0 else r.char_level
+
+        if reading.cp_max > 0 and reading.cp_current <= reading.cp_max:
+            cp_cur, cp_max = reading.cp_current, reading.cp_max
+        else:
+            cp_cur, cp_max = r.cp_current, r.cp_max
+
+        if reading.hp_max > 0 and reading.hp_current <= reading.hp_max:
+            hp_cur, hp_max = reading.hp_current, reading.hp_max
+        else:
+            hp_cur, hp_max = r.hp_current, r.hp_max
+
+        if reading.mp_max > 0 and reading.mp_current <= reading.mp_max:
+            mp_cur, mp_max = reading.mp_current, reading.mp_max
+        else:
+            mp_cur, mp_max = r.mp_current, r.mp_max
+
+        xp_pct = reading.xp_percent if reading.xp_percent > 0 else r.xp_percent
+
+        # Update runner fields (atomic under GIL)
+        r.char_level = level
+        r.cp_current, r.cp_max = cp_cur, cp_max
+        r.hp_current, r.hp_max = hp_cur, hp_max
+        r.mp_current, r.mp_max = mp_cur, mp_max
+        r.xp_percent = xp_pct
+
+        # Build event for the main loop to publish
+        cp_ratio = cp_cur / cp_max if cp_max > 0 else 0.0
+        hp_ratio = hp_cur / hp_max if hp_max > 0 else 0.0
+        mp_ratio = mp_cur / mp_max if mp_max > 0 else 0.0
+        log.debug(
+            f"[stats:update] Lv{level} "
+            f"CP:{cp_ratio:.0%} "
+            f"HP:{hp_ratio:.0%} "
+            f"MP:{mp_ratio:.0%} "
+            f"XP:{xp_pct:.2f}%"
+        )
+        self._pending_event = {
+            "type": "STATS_UPDATE",
+            "level": level,
+            "cp_percent": round(cp_ratio * 100, 1),
+            "hp_percent": round(hp_ratio * 100, 1),
+            "mp_percent": round(mp_ratio * 100, 1),
+            "xp_percent": round(xp_pct, 2),
+        }
+
+
 class ScenarioRunner:
     """Holds all scenarios as methods with shared instance state."""
 
@@ -67,7 +174,7 @@ class ScenarioRunner:
         # Shared store for data received from remote bots
         self.remote_state: RemoteStateStore = remote_state or RemoteStateStore()
 
-        # Character stats (updated by read_stats_ocr)
+        # Character stats (updated by StatsReader background thread)
         self.char_level: int = 0
         self.cp_current: int = 0
         self.cp_max: int = 0
@@ -779,84 +886,7 @@ class ScenarioRunner:
             else:
                 log.warning(f"[equip:fail] template 'item-{equip}' not found on hotbar")
 
-    # ── OCR-based stat reading ────────────────────────────────────
-
-    async def read_stats_ocr(
-        self,
-        frame: np.ndarray,
-        matcher: TemplateMatcher,
-        ih: InputHandler,
-        bus: EventBus,
-        event: Optional[dict] = None,
-    ) -> None:
-        """Read CP, HP, MP, XP and level from REGION_GENERAL_STATS.
-
-        Delegates the heavy OCR work to ``bot.ocr.read_stats()``.
-        Publishes STATS_UPDATE events over the network so other bots
-        can react.
-        """
-        reading = ocr.read_stats(frame)
-        if reading is None:
-            return
-
-        # Use previous values as fallback for fields OCR didn't detect.
-        # Also reject readings where current > max – that's always an
-        # OCR mis-read (e.g. '/' read as '1' turning '92/440' into 921/440).
-        level  = reading.level      if reading.level > 0      else self.char_level
-
-        if reading.cp_max > 0 and reading.cp_current <= reading.cp_max:
-            cp_cur, cp_max = reading.cp_current, reading.cp_max
-        else:
-            cp_cur, cp_max = self.cp_current, self.cp_max
-
-        if reading.hp_max > 0 and reading.hp_current <= reading.hp_max:
-            hp_cur, hp_max = reading.hp_current, reading.hp_max
-        else:
-            hp_cur, hp_max = self.hp_current, self.hp_max
-
-        if reading.mp_max > 0 and reading.mp_current <= reading.mp_max:
-            mp_cur, mp_max = reading.mp_current, reading.mp_max
-        else:
-            mp_cur, mp_max = self.mp_current, self.mp_max
-
-        xp_pct = reading.xp_percent if reading.xp_percent > 0 else self.xp_percent
-
-        # Check if anything changed
-        changed = (
-            level != self.char_level
-            or cp_cur != self.cp_current or cp_max != self.cp_max
-            or hp_cur != self.hp_current or hp_max != self.hp_max
-            or mp_cur != self.mp_current or mp_max != self.mp_max
-            or abs(xp_pct - self.xp_percent) > 0.001
-        )
-
-        self.char_level = level
-        self.cp_current, self.cp_max = cp_cur, cp_max
-        self.hp_current, self.hp_max = hp_cur, hp_max
-        self.mp_current, self.mp_max = mp_cur, mp_max
-        self.xp_percent = xp_pct
-
-        now = _time.monotonic()
-        if changed or (now - self._last_stats_publish > 5.0):
-            self._last_stats_publish = now
-            cp_ratio = cp_cur / cp_max if cp_max > 0 else 0.0
-            hp_ratio = hp_cur / hp_max if hp_max > 0 else 0.0
-            mp_ratio = mp_cur / mp_max if mp_max > 0 else 0.0
-            log.debug(
-                f"[stats:update] Lv{level} "
-                f"CP:{cp_ratio:.0%} "
-                f"HP:{hp_ratio:.0%} "
-                f"MP:{mp_ratio:.0%} "
-                f"XP:{xp_pct:.2f}%"
-            )
-            await bus.publish({
-                "type": "STATS_UPDATE",
-                "level": level,
-                "cp_percent": round(cp_ratio * 100, 1),
-                "hp_percent": round(hp_ratio * 100, 1),
-                "mp_percent": round(mp_ratio * 100, 1),
-                "xp_percent": round(xp_pct, 2),
-            })
+    # ── OCR-based stat reading (moved to StatsReader background thread) ──
 
     # ── Camera calibration (dev tool) ─────────────────────────────
 
@@ -1049,7 +1079,6 @@ class ScenarioRunner:
             "engage_target": self.engage_target,
             "acquire_target": self.acquire_target,
             "scan_nearby_mobs": self.scan_nearby_mobs,
-            "read_stats_ocr": self.read_stats_ocr,
             "scan_skill_cooldowns": self.scan_skill_cooldowns,
             "apply_buffs": self.apply_buffs,
             "update_toggle_skills": self.update_toggle_skills,
