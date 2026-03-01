@@ -216,6 +216,7 @@ class ScenarioRunner:
             fresh = self.capture.grab()
             if vision.has_target(fresh, matcher):
                 log.debug(f"[target:acquire] target acquired on attempt {attempt} → TARGET_ACQUIRED")
+                ih.press(config.KEY_ATTACK)  # start walking/attacking immediately
                 self._set_state(BotState.TARGET_ACQUIRED)
                 return
 
@@ -693,9 +694,17 @@ class ScenarioRunner:
                 self._execute_buff_action(post, fresh, matcher, ih)
                 sleep(0.2)
 
-        # Done – transition to READY_TO_ATTACK (attack scenario will press the key next tick)
-        log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) → READY_TO_ATTACK")
-        self._set_state(BotState.READY_TO_ATTACK)
+        # Done – press attack immediately and go straight to ATTACKING.
+        # This avoids waiting for attack_mob_in_range on the next tick.
+        fresh = self.capture.grab()
+        if vision.has_target(fresh, matcher) and vision.target_has_hp(fresh):
+            log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) – pressing attack → ATTACKING")
+            ih.press(config.KEY_ATTACK)
+            self._last_attack_press = _time.monotonic()
+            self._set_state(BotState.ATTACKING)
+        else:
+            log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) → READY_TO_ATTACK")
+            self._set_state(BotState.READY_TO_ATTACK)
 
     def _check_buff_conditions(self, conditions: dict) -> bool:
         """Evaluate buff conditions against current character stats.
