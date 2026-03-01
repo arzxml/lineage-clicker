@@ -40,16 +40,14 @@ class BotState(enum.Enum):
     """Granular activity states for the bot."""
     IDLE = "idle"
     MOVING = "moving"                           # walking toward a mob
-    IN_RANGE = "in_range"                       # mob nearby, ready for targeting
-    LOOKING_FOR_TARGET = "looking_for_target"   # post-loot, checking for nearby mobs
-    LOOTING = "looting"                         # picking up drops
-    LOOTING_DONE = "looting_done"               # loot finished, check for nearby mobs
-    TARGET_KILLED = "target_killed"             # target just died, ready to loot
-    ATTACKING = "attacking"                     # actively attacking a target
-    ATTACKING_NEARBY = "attacking"              # (alias) fighting a nearby mob
-    TARGET_ACQUIRED = "target_acquired"         # target just acquired, run buffs before attacking
-    PRE_ORIENTING = "pre_orienting"             # camera pre-rotation
-    PATROLLING = "patrolling"                   # returning to patrol zone
+    TARGETING_NEARBY_TARGET = "targeting_nearby_target"        # pressing next-target (up to 3 tries)
+    TARGET_ACQUIRED = "target_acquired"          # target locked, buffs phase begins
+    PREPARING_TO_ATTACK = "applying_buffs"       # applying buffs
+    READY_TO_ATTACK = "ready_to_attack"          # buffs done, next tick will attack
+    ATTACKING = "attacking"                      # actively attacking a target
+    TARGET_KILLED = "target_killed"              # target just died, ready to loot
+    LOOTING = "looting"                          # picking up drops
+    LOOTING_DONE = "looting_done"                # loot finished, check for nearby mobs
 
 
 class BotStopRequested(Exception):
@@ -168,9 +166,9 @@ class ScenarioRunner:
 
         if result is not None and result[2] <= close_range:
             log.debug(
-                f"[check_mobs:found] mob nearby (dist={result[2]:.2f} <= {close_range}) → IN_RANGE"
+                f"[check_mobs:found] mob nearby (dist={result[2]:.2f} <= {close_range}) → TARGETING_NEARBY_TARGET"
             )
-            self._set_state(BotState.IN_RANGE)
+            self._set_state(BotState.TARGETING_NEARBY_TARGET)
         else:
             dist_str = f"dist={result[2]:.2f}" if result else "none_found"
             log.debug(f"[check_mobs:none] no mob in close range ({dist_str}) → IDLE")
@@ -186,33 +184,51 @@ class ScenarioRunner:
     ) -> None:
         """Press next-target key to acquire a target (no attack).
 
-        Activates when IDLE or IN_RANGE and there is no current target.
-        After pressing next-target, verifies acquisition.  If it fails
-        and we were IN_RANGE, falls back to IDLE so move_to_mobs can
-        walk closer.
+        In TARGETING_NEARBY_TARGET state (mob known to be nearby):
+          tries up to 3 times with short delays between attempts.
+        In IDLE state: single attempt as a quick check.
+
+        On success → TARGET_ACQUIRED.
+        On failure  → IDLE (so move_to_mobs can walk closer).
         """
-        if self._state not in (BotState.IDLE, BotState.IN_RANGE):
+        if self._state not in (BotState.IDLE, BotState.TARGETING_NEARBY_TARGET):
             return
-        if vision.has_target(frame, matcher):
+        # In TARGETING_NEARBY_TARGET, always use a fresh frame.  The tick
+        # frame may be seconds stale if loot_on_dead_target ran earlier
+        # in the same tick (~2.8 s of looting).  The stale frame still
+        # shows the old dead target, causing a false-positive here.
+        check_frame = self.capture.grab() if self._state == BotState.TARGETING_NEARBY_TARGET else frame
+        if vision.has_target(check_frame, matcher):
+            # Already have a target – advance so buffs / attack proceed.
+            if self._state == BotState.TARGETING_NEARBY_TARGET:
+                log.debug("[target:acquire] already have a target → TARGET_ACQUIRED")
+                ih.press(config.KEY_ATTACK) # press attack one, to start walking to it to optimize for time
+                self._set_state(BotState.TARGET_ACQUIRED)
             return
 
-        log.debug("[target:acquire] no target – pressing next-target")
-        ih.press(config.KEY_NEXT_TARGET)
-        sleep(0.15)
+        max_attempts = 3 if self._state == BotState.TARGETING_NEARBY_TARGET else 1
 
-        # Verify we actually got a target
-        fresh = self.capture.grab()
-        if vision.has_target(fresh, matcher):
-            log.debug("[target:acquire] target acquired → TARGET_ACQUIRED")
-            self._set_state(BotState.TARGET_ACQUIRED)
-        else:
-            # next-target didn't reach anything—mob is too far
-            if self._state == BotState.IN_RANGE:
-                log.debug(
-                    "[target:acquire] next-target failed while IN_RANGE "
-                    "– falling back to IDLE so move_to_mobs can walk closer"
-                )
-                self._clear_state()
+        for attempt in range(1, max_attempts + 1):
+            log.debug(f"[target:acquire] attempt {attempt}/{max_attempts} – pressing next-target")
+            ih.press(config.KEY_NEXT_TARGET)
+            sleep(0.15)
+
+            fresh = self.capture.grab()
+            if vision.has_target(fresh, matcher):
+                log.debug(f"[target:acquire] target acquired on attempt {attempt} → TARGET_ACQUIRED")
+                self._set_state(BotState.TARGET_ACQUIRED)
+                return
+
+            if attempt < max_attempts:
+                sleep(0.3)  # short pause before retrying
+
+        # All attempts exhausted
+        if self._state == BotState.TARGETING_NEARBY_TARGET:
+            log.debug(
+                f"[target:acquire] failed after {max_attempts} attempts "
+                "– falling back to IDLE so move_to_mobs can walk closer"
+            )
+            self._clear_state()
 
     async def attack_mob_in_range(
         self,
@@ -224,9 +240,9 @@ class ScenarioRunner:
     ) -> None:
         """Press attack if we have a live target.
 
-        Activates when IDLE or IN_RANGE and a target is present.
-        Sets state to ATTACKING so subsequent ticks skip this scenario
-        until the target dies or disappears.
+        Activates in READY_TO_ATTACK (after buffs applied) to begin combat.
+        While ATTACKING, periodically re-presses the attack key as a
+        keep-alive in case auto-attack drops.
         """
         # While ATTACKING, periodically re-press attack key in case
         # auto-attack dropped (mob moved, lag, character interrupted, etc.)
@@ -238,18 +254,23 @@ class ScenarioRunner:
                 ih.press(config.KEY_ATTACK)
                 self._last_attack_press = now
             return
-        if self._state not in (BotState.IDLE, BotState.IN_RANGE, BotState.TARGET_ACQUIRED):
+
+        if self._state != BotState.READY_TO_ATTACK:
             return
-        if not vision.has_target(frame, matcher):
+        # Grab a fresh frame — the tick frame may be stale after long
+        # scenarios (looting, OCR) that ran earlier in this same tick.
+        fresh = self.capture.grab()
+        if not vision.has_target(fresh, matcher):
+            # No target visible.  Go to TARGETING_NEARBY_TARGET (3 tries)
+            # instead of IDLE (1 try), since a mob may still be nearby.
+            log.debug("[attack:skip] READY_TO_ATTACK but no target visible → TARGETING_NEARBY_TARGET")
+            self._set_state(BotState.TARGETING_NEARBY_TARGET)
             return
+        frame = fresh  # use the fresh frame for subsequent HP check too
         # Don't attack a dead target (avoids double-loot cycle)
         if not vision.target_has_hp(frame):
-            log.debug("[attack:skip] target HP is 0 – won't attack a dead target")
-            # If we just came from TARGET_ACQUIRED (buff phase) and mob died
-            # in the meantime, go straight to TARGET_KILLED so loot picks it up.
-            if self._state == BotState.TARGET_ACQUIRED:
-                log.debug("[attack:skip] was TARGET_ACQUIRED → TARGET_KILLED (mob died during buffs)")
-                self._set_state(BotState.TARGET_KILLED)
+            log.debug("[attack:skip] target HP is 0 → TARGET_KILLED (mob died during buffs)")
+            self._set_state(BotState.TARGET_KILLED)
             return
 
         log.debug("[attack:engage] target alive with HP – pressing attack key")
@@ -286,8 +307,8 @@ class ScenarioRunner:
                 capture=self.capture,
             )
             self._pre_oriented = False
-            # Signal attack_mob_in_range to pick up the nearby mob
-            self._set_state(BotState.IN_RANGE)
+            # Mob should be nearby now – try targeting
+            self._set_state(BotState.TARGETING_NEARBY_TARGET)
         except Exception:
             self._clear_state()
             raise
@@ -314,10 +335,20 @@ class ScenarioRunner:
 
         has_tgt = vision.has_target(frame, matcher)
         if not has_tgt:
-            # Target gone (despawned / out of range) — back to idle
-            log.debug("[combat:died] target frame disappeared (despawned/out of range) → IDLE")
-            self._last_target_hp = -1.0
-            self._clear_state()
+            # Target frame disappeared.  If the last recorded HP was near
+            # zero, the mob almost certainly died and despawned — treat as
+            # a kill so the loot phase runs.  Otherwise it genuinely left.
+            if 0 <= self._last_target_hp < 0.02:
+                log.debug(
+                    f"[combat:died] target vanished with low HP "
+                    f"({self._last_target_hp:.3f}) → TARGET_KILLED (will loot)"
+                )
+                self._last_target_hp = -1.0
+                self._set_state(BotState.TARGET_KILLED)
+            else:
+                log.debug("[combat:died] target frame disappeared (despawned/out of range) → IDLE")
+                self._last_target_hp = -1.0
+                self._clear_state()
             return
 
         if vision.target_is_dead(frame, matcher, capture=self.capture):
@@ -374,14 +405,16 @@ class ScenarioRunner:
     def _do_loot(self, ih: InputHandler, matcher: Optional[TemplateMatcher] = None) -> None:
         """Press loot key several times then cancel target."""
         _loot_t0 = _time.monotonic()
-        for i in range(10):
+        press_count = getattr(config, "LOOT_PRESS_COUNT", 10)
+        press_delay = getattr(config, "LOOT_PRESS_DELAY", 0.05)
+        for i in range(press_count):
             ih.press(config.KEY_LOOT)
-            sleep(0.1)
+            sleep(press_delay)
             if matcher is not None:
                 self._check_exit(matcher)
         self._cancel_target(ih)
         sleep(0.1)
-        log.debug(f"[loot:done] loot sequence finished ({(_time.monotonic()-_loot_t0)*1000:.0f}ms, 10 presses + cancel)")
+        log.debug(f"[loot:done] loot sequence finished ({(_time.monotonic()-_loot_t0)*1000:.0f}ms, {press_count} presses + cancel)")
 
     async def pre_orient_to_next_mob(
         self,
@@ -413,20 +446,24 @@ class ScenarioRunner:
 
         close_range = getattr(config, "MOB_CLOSE_RANGE", 0.15)
 
-        # Check if there are OTHER mobs nearby (skip the one we're fighting,
-        # which sits at the very centre of the minimap / very close range).
-        all_mobs = vision._find_all_mobs_on_minimap(frame)
-        nearby_others = [
-            m for m in all_mobs
-            if m[2] <= close_range and m[2] > 0.02  # > 0.02 to skip the player dot
-        ]
-        if nearby_others:
-            # There are mobs close by — no need to rotate
+        # Check if there are other mobs near enough for F10 next-target.
+        # The mob we're fighting sits at melee range (~0.03-0.05 normalised),
+        # so look for the nearest mob BEYOND that zone.  If one exists
+        # within close_range, F10 will handle it — no need to pre-orient.
+        melee_buffer = 0.06  # just above typical melee distance
+        next_mob = vision.find_nearest_mob_on_minimap(
+            frame, min_dist=melee_buffer,
+        )
+        if next_mob is not None and next_mob[2] <= close_range:
+            # There's a mob F10 can target after the current kill
             return
 
-        # Find the nearest mob beyond close range (the next target)
+        # Find the nearest mob beyond close range (the next target).
+        # Use a generous margin above close_range so the fighting mob's
+        # minimap dot (which fluctuates by ±0.03) doesn't leak through.
+        orient_min_dist = close_range + 0.04
         result = vision.find_nearest_mob_on_minimap(
-            frame, min_dist=close_range,
+            frame, min_dist=orient_min_dist,
         )
         if result is None:
             # No distant mobs either — nothing to aim at
@@ -452,6 +489,7 @@ class ScenarioRunner:
 
         if navigation.rotate_camera_toward_mob(
             ih, mob_dist=dist,
+            min_dist=orient_min_dist,
             check_exit=lambda: self._check_exit(matcher),
             capture=self.capture,
         ):
@@ -466,139 +504,6 @@ class ScenarioRunner:
                 f"({(_time.monotonic()-_po_t0)*1000:.0f}ms)"
             )
 
-    async def return_to_patrol_zone(
-        self,
-        frame: np.ndarray,
-        matcher: TemplateMatcher,
-        ih: InputHandler,
-        bus: EventBus,
-        event: Optional[dict] = None,
-    ) -> None:
-        """Periodically check the map; if outside patrol zone, walk back.
-
-        The map auto-centres on the player, so the offset of the
-        patrol_zone template from the map centre tells us how far
-        (and in which direction) the player has drifted.
-        """
-        if not self.is_idle:
-            return
-        # Don't check while we have a live target
-        if vision.has_target(frame, matcher):
-            return
-
-        interval = getattr(config, "PATROL_CHECK_INTERVAL", 30.0)
-        now = _time.monotonic()
-        if now - self._last_patrol_check < interval:
-            return
-
-        self._set_state(BotState.PATROLLING)
-        try:
-            self._last_patrol_check = now
-            result = navigation.check_patrol_zone(ih, matcher, capture=self.capture)
-            if result is None:
-                log.debug("[patrol:check] could not locate patrol_zone on map – skipping")
-                return
-
-            dx, dy, dist = result
-            threshold = getattr(config, "PATROL_MAX_DRIFT_PX", 60)
-            if dist <= threshold:
-                log.debug(f"[patrol:check] inside zone (drift={dist:.0f}px <= {threshold}px threshold)")
-                self._returning_to_zone = False
-                return
-
-            log.info(
-                f"[patrol:return] outside zone (drift={dist:.0f}px > {threshold}px) "
-                f"– walking back"
-            )
-            self._returning_to_zone = True
-
-            # Direction from player toward the patrol zone.
-            # On the map: +dx = zone is right of player, +dy = zone is below.
-            # Target angle in map-space: atan2(dx, -dy)  (0 = north, + = CW)
-            target_angle = math.atan2(dx, -dy)
-            log.debug(
-                f"[patrol:return] facing {math.degrees(target_angle):.1f}° "
-                f"toward zone – rotating camera"
-            )
-
-            navigation.rotate_camera_by_angle(ih, target_angle, capture=self.capture)
-
-            # Walk forward toward the zone
-            steps = getattr(config, "PATROL_RETURN_STEPS", 15)
-            navigation.walk_in_direction(
-                ih, 0.0, steps=steps,
-                check_exit=lambda: self._check_exit(matcher),
-                capture=self.capture,
-            )
-
-        finally:
-            self._clear_state()
-
-    # async def assist_ppl_then_attack_on_dead_or_non_existing_target(
-    #     self,
-    #     frame: np.ndarray,
-    #     matcher: TemplateMatcher,
-    #     ih: InputHandler,
-    #     bus: EventBus,
-    #     event: Optional[dict] = None,
-    # ) -> None:
-    #     if not self.is_idle:
-    #         return
-
-    #     if not vision.has_target(frame, matcher) or vision.target_is_dead(frame, matcher):
-    #         self._set_state(BotState.ATTACKING_NEARBY)
-    #         try:
-    #             log.debug("[assist:start] no target / dead target – assisting party member")
-    #             ih.press(config.KEY_TARGET_PPL)
-    #             ih.press(config.KEY_ASSIST)
-    #             ih.press(config.KEY_ATTACK)
-    #         finally:
-    #             self._clear_state()
-
-    # async def auto_attack(
-    #     self,
-    #     frame: np.ndarray,
-    #     matcher: TemplateMatcher,
-    #     ih: InputHandler,
-    #     bus: EventBus,
-    #     event: Optional[dict] = None,
-    # ) -> None:
-    #     """Target nearest enemy and attack."""
-    #     if matcher.find(frame, "target_hp_bar") is None:
-    #         log.debug("[auto_attack:search] no target frame – pressing target key")
-    #         ih.press("f1")
-    #     else:
-    #         attack_btn = matcher.find(frame, "attack_button")
-    #         if ih.click_template(attack_btn):
-    #             log.debug("[auto_attack:engage] clicked attack button")
-
-    # async def loot_nearby(
-    #     self,
-    #     frame: np.ndarray,
-    #     matcher: TemplateMatcher,
-    #     ih: InputHandler,
-    #     bus: EventBus,
-    #     event: Optional[dict] = None,
-    # ) -> None:
-    #     """Click loot bags on screen."""
-    #     loot = matcher.find(frame, "loot_bag")
-    #     if loot:
-    #         x, y, conf = loot
-    #         log.info(f"[loot_nearby:found] loot bag at ({x},{y}) conf={conf:.2f} – clicking")
-    #         ih.click(x, y)
-    #         await bus.publish({"type": "LOOT_SPOTTED", "x": x, "y": y})
-
-    # async def react_to_remote_loot(
-    #     self,
-    #     frame: np.ndarray,
-    #     matcher: TemplateMatcher,
-    #     ih: InputHandler,
-    #     bus: EventBus,
-    #     event: Optional[dict] = None,
-    # ) -> None:
-    #     """React when the other PC spots loot."""
-    #     if event and event.get("type") == "LOOT_SPOTTED":
-    #         log.info(f"[remote_loot:received] partner spotted loot: {event}")
 
     async def stop_if_exit_game(
         self,
@@ -742,6 +647,7 @@ class ScenarioRunner:
             return
 
         _buff_t0 = _time.monotonic()
+        self._set_state(BotState.PREPARING_TO_ATTACK)
 
         for skill_name, cfg in self.buff_skills_to_use.items():
             # 1. Check availability
@@ -787,12 +693,9 @@ class ScenarioRunner:
                 self._execute_buff_action(post, fresh, matcher, ih)
                 sleep(0.2)
 
-        # Done – press attack and transition to ATTACKING
-        log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) – pressing attack")
-        ih.press(config.KEY_ATTACK)
-        self._last_attack_press = _time.monotonic()
-        self._set_state(BotState.ATTACKING)
-        log.debug("[buff:done] attack key sent – now ATTACKING")
+        # Done – transition to READY_TO_ATTACK (attack scenario will press the key next tick)
+        log.debug(f"[buff:done] buff phase complete ({(_time.monotonic()-_buff_t0)*1000:.0f}ms) → READY_TO_ATTACK")
+        self._set_state(BotState.READY_TO_ATTACK)
 
     def _check_buff_conditions(self, conditions: dict) -> bool:
         """Evaluate buff conditions against current character stats.
@@ -1133,7 +1036,7 @@ class ScenarioRunner:
             "check_target_died": self.check_target_died,
             "loot_on_dead_target": self.loot_on_dead_target,
             "pre_orient_to_next_mob": self.pre_orient_to_next_mob,
-            "return_to_patrol_zone": self.return_to_patrol_zone,
+            # "return_to_patrol_zone": self.return_to_patrol_zone,
             "attack_mob_in_range": self.attack_mob_in_range,
             "target_mob_in_range": self.target_mob_in_range,
             "check_mobs_in_range": self.check_mobs_in_range,

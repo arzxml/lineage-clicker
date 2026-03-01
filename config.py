@@ -13,7 +13,7 @@ REMOTE_STATE_FILE = "remote_state.json"  # persisted snapshot of all remote char
 
 # ── Screen capture ────────────────────────────
 # Monitor index (0 = all monitors, 1 = primary, 2 = secondary …)
-MONITOR_INDEX = 2
+MONITOR_INDEX = 1
 # How many times per second we capture the screen
 CAPTURE_FPS = 5
 
@@ -35,7 +35,6 @@ ACTIVE_SCENARIOS: list[str] = [
     "check_target_died",
     "loot_on_dead_target",
     "check_mobs_in_range",
-    "return_to_patrol_zone",
     "pre_orient_to_next_mob",
     "attack_mob_in_range",
     "target_mob_in_range",
@@ -66,6 +65,10 @@ KEY_TARGET_PPL = "f12"
 KEY_ASSIST = "f11"
 KEY_NEXT_TARGET = "f10"
 
+# Looting
+LOOT_PRESS_COUNT = 10     # number of F4 presses per loot sequence
+LOOT_PRESS_DELAY = 0.05   # seconds between loot presses
+
 # Movement
 MOVE_CLICK_RADIUS = 700   # how far (px) from screen center to click when walking (directional)
 MOVE_FORWARD_CLICK_PX = 250  # how far above screen center to click when walking forward
@@ -76,9 +79,11 @@ MOB_MELEE_RANGE   = 0.03  # mob this close is likely attacking us — fight befo
 CAMERA_TILT_UP_PX          = 5     # px to drag up from top-down (small! too much = sky)
 CAMERA_ROTATE_MAX_PX       = 50    # max px to drag left/right for a full 180° rotation
 CAMERA_PX_PER_RAD          = 19.0  # pixels of right-drag per radian of CW camera rotation (calibrated)
-CAMERA_NORTH_THRESHOLD_DEG = 5    # degrees – half-width of "north" cone
+CAMERA_NORTH_THRESHOLD_DEG = 15    # degrees – half-width of "north" cone (generous for rotation)
 CAMERA_STEP_PX             = 1     # px per nudge (1 = smallest possible mouse step)
-CAMERA_MAX_PASSES          = 180   # max nudge iterations before giving upCAMERA_SETTLE_MS           = 30    # ms to wait after each mouse move for the game to update
+CAMERA_MAX_PASSES          = 180   # max nudge iterations before giving up
+CAMERA_SETTLE_MS           = 30    # ms to wait after each mouse move for the game to update
+CAMERA_RECENTER_EVERY      = 30    # re-grip mouse every N nudges to avoid drag-distance cap
 # Pre-orient: HP ratio below which the bot starts orienting to the next mob
 PRE_ORIENT_HP_THRESHOLD = 0.10  # roughly ≈15 % HP remaining
 

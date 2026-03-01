@@ -95,11 +95,14 @@ def target_is_dead(
     _cap = capture or ScreenCapture()
     frame2 = _cap.grab()
     if not has_target(frame2, matcher):
+        # Target vanished during confirm — it had 0 HP already,
+        # so it almost certainly died and despawned quickly.
         log.debug(
             f"[target:dead_check] target vanished during confirm "
+            f"(HP was 0 → treating as DEAD) "
             f"({(_time.monotonic() - _t0) * 1000:.0f}ms)"
         )
-        return False
+        return True
     is_dead = not target_has_hp(frame2)
     log.debug(
         f"[target:dead_check] confirmed={'DEAD' if is_dead else 'ALIVE'} "
@@ -163,7 +166,7 @@ def _find_all_mobs_on_minimap(
         cdx = mx - center_x
         cdy = my - center_y
         dist_px = math.hypot(cdx, cdy)
-        if dist_px < 5:          # skip player dot
+        if dist_px < 3:          # skip player dot (tight: melee mobs at ~5 px must pass)
             continue
         norm_dx = cdx / radius
         norm_dy = cdy / radius
@@ -189,6 +192,25 @@ def has_mob_at_north(
         if abs(angle) <= half_cone:
             return True
     return False
+
+
+def nearest_mob_at_north(
+    frame: np.ndarray,
+    half_cone_deg: float = 30.0,
+    min_dist: Optional[float] = None,
+) -> bool:
+    """Return True if the *nearest* mob on the minimap is within the north cone.
+
+    Unlike :func:`has_mob_at_north`, this only considers the closest mob,
+    preventing the camera from locking onto a far mob that happens to
+    pass through the north cone during rotation.
+    """
+    nearest = find_nearest_mob_on_minimap(frame, min_dist=min_dist)
+    if nearest is None:
+        return False
+    dx, dy, dist = nearest
+    angle = math.atan2(dx, -dy)
+    return abs(angle) <= math.radians(half_cone_deg)
 
 
 def find_nearest_mob_on_minimap(

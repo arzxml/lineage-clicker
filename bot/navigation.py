@@ -43,6 +43,7 @@ def get_screen_center(capture: Optional[ScreenCapture] = None) -> tuple[int, int
 def rotate_camera_toward_mob(
     ih: InputHandler,
     mob_dist: Optional[float] = None,
+    min_dist: Optional[float] = None,
     check_exit: CheckExitFn = None,
     capture: Optional[ScreenCapture] = None,
 ) -> bool:
@@ -51,10 +52,12 @@ def rotate_camera_toward_mob(
     Holds right-mouse-button and moves the mouse in small steps.
     This avoids the overhead of full press/move/release per nudge.
 
-    Logic:
-      1. If any mob is already in the north cone → done.
-      2. Pick a direction based on nearest mob, commit to it.
-      3. Hold right-click, nudge mouse step-by-step until a mob is north.
+    Parameters
+    ----------
+    mob_dist : float, optional
+        Prefer the mob at this normalised distance (track across rotation).
+    min_dist : float, optional
+        Ignore mobs closer than this (e.g. the mob we're fighting).
 
     Returns ``True`` if a mob ended up north, ``False`` if all mobs lost.
     """
@@ -62,31 +65,57 @@ def rotate_camera_toward_mob(
     cx, cy = get_screen_center(_cap)
 
     north_cone_deg = getattr(config, "CAMERA_NORTH_THRESHOLD_DEG", 20)
+    north_cone_rad = math.radians(north_cone_deg)
     step_px        = getattr(config, "CAMERA_STEP_PX", 1)
     max_passes     = getattr(config, "CAMERA_MAX_PASSES", 180)
     settle_ms      = getattr(config, "CAMERA_SETTLE_MS", 30) / 1000.0
 
-    # ── 1. Already have a mob at north? ──────────────────────────
+    def _tracked_mob_at_north(fr) -> bool:
+        """Check if the mob we're tracking (by *mob_dist*) is in the north cone.
+
+        Uses ``target_dist=mob_dist`` so that when multiple mobs exist,
+        we evaluate the one at the expected distance — not just the
+        nearest one (which may be a different mob off to the side).
+        """
+        tracked = vision.find_nearest_mob_on_minimap(
+            fr, target_dist=mob_dist, min_dist=min_dist,
+        )
+        if tracked is None:
+            return False
+        tdx, tdy, _ = tracked
+        return abs(math.atan2(tdx, -tdy)) <= north_cone_rad
+
+    # ── 1. Already have the target mob at north? ─────────────────
     frame = _cap.grab()
-    if vision.has_mob_at_north(frame, half_cone_deg=north_cone_deg):
-        log.debug("[camera:rotate] mob already at north – no rotation needed")
+    if _tracked_mob_at_north(frame):
+        log.debug("[camera:rotate] tracked mob already at north – no rotation needed")
         return True
 
     # ── 2. Pick a committed direction ────────────────────────────
-    r = vision.find_nearest_mob_on_minimap(frame, target_dist=mob_dist)
+    r = vision.find_nearest_mob_on_minimap(frame, target_dist=mob_dist, min_dist=min_dist)
     if r is None:
         log.debug("[camera:rotate] no mobs on minimap – cannot orient")
         return False
 
     dx, dy, dist = r
     angle = math.atan2(dx, -dy)                     # +ve = mob is to the right
-    direction = 1 if angle > 0 else -1               # commit: never change
+    # For mobs near ±180° (directly behind), default to left to avoid
+    # ambiguity oscillation.  For anything else, pick the shorter arc.
+    if abs(angle) > math.radians(170):
+        direction = -1  # nudge left (arbitrary but consistent)
+    else:
+        direction = 1 if angle > 0 else -1
     log.debug(
-        f"[camera:rotate] mob at {math.degrees(angle):+.1f}° – "
+        f"[camera:rotate] mob at {math.degrees(angle):+.1f}° dist={dist:.2f} – "
         f"will nudge {'right' if direction > 0 else 'left'}"
     )
 
     # ── 3. Hold right-click and nudge ───────────────────────────
+    # Periodically release, recenter, and re-grip to prevent the
+    # mouse from drifting far from centre (the game may cap or
+    # ignore camera rotation beyond a certain drag distance).
+    recenter_every = getattr(config, "CAMERA_RECENTER_EVERY", 30)
+
     ih.move_to(cx, cy)
     sleep(0.02)
     ih.mouse_down("right")
@@ -100,17 +129,40 @@ def rotate_camera_toward_mob(
             ih.move_to(current_x, cy)
             sleep(settle_ms)
 
+            # Recenter the mouse before it drifts too far
+            if recenter_every and (i + 1) % recenter_every == 0:
+                ih.mouse_up("right")
+                sleep(0.05)          # give the game time to register button-up
+                current_x = cx
+                ih.move_to(cx, cy)
+                sleep(0.02)
+                ih.mouse_down("right")
+                sleep(0.02)
+
             frame = _cap.grab()
 
-            if vision.has_mob_at_north(frame, half_cone_deg=north_cone_deg):
+            if _tracked_mob_at_north(frame):
                 log.debug(
-                    f"[camera:rotate] mob entered north cone after {i+1} nudges"
+                    f"[camera:rotate] tracked mob entered north cone after {i+1} nudges"
                 )
                 success = True
                 break
 
-            # If ALL mobs disappeared, bail out
-            if vision.find_nearest_mob_on_minimap(frame) is None:
+            # Periodic angle logging for diagnostics
+            if (i + 1) % 10 == 0:
+                diag = vision.find_nearest_mob_on_minimap(
+                    frame, target_dist=mob_dist, min_dist=min_dist,
+                )
+                if diag is not None:
+                    _dx, _dy, _dist = diag
+                    _ang = math.degrees(math.atan2(_dx, -_dy))
+                    log.debug(
+                        f"[camera:rotate] nudge {i+1}: tracked mob at "
+                        f"{_ang:+.1f}° dist={_dist:.2f}"
+                    )
+
+            # If ALL mobs (beyond min_dist) disappeared, bail out
+            if vision.find_nearest_mob_on_minimap(frame, min_dist=min_dist) is None:
                 log.debug(f"[camera:rotate] all mobs lost after {i+1} nudges")
                 break
 
@@ -243,6 +295,10 @@ def move_to_closest_mob(
 
     _walk_t0 = _time.monotonic()
     max_clicks = 40
+    north_cone_deg = getattr(config, "CAMERA_NORTH_THRESHOLD_DEG", 20)
+    # How far off-north (degrees) before we correct course mid-walk
+    correct_threshold_deg = getattr(config, "MOVE_CORRECT_THRESHOLD_DEG", 35)
+
     for i in range(max_clicks):
         ih.click(walk_x, walk_y)
         sleep(0.45)
@@ -255,16 +311,34 @@ def move_to_closest_mob(
                 f"({(_time.monotonic()-_walk_t0)*1000:.0f}ms walk)"
             )
             break
-        _, _, dist = result
+        dx, dy, dist = result
         if dist <= close_range:
             log.debug(
                 f"[move:walk] mob in range (dist={dist:.2f}) after {i+1} steps "
                 f"({(_time.monotonic()-_walk_t0)*1000:.0f}ms walk)"
             )
             break
+
+        # ── Mid-walk course correction ──────────────────────────
+        # If the nearest mob has drifted significantly off-north,
+        # re-orient the camera before continuing to walk forward.
+        mob_angle_deg = math.degrees(math.atan2(dx, -dy))
+        if abs(mob_angle_deg) > correct_threshold_deg:
+            log.debug(
+                f"[move:correct] mob drifted to {mob_angle_deg:+.1f}° "
+                f"(>{correct_threshold_deg}°) at step {i+1} – re-orienting"
+            )
+            if not rotate_camera_toward_mob(
+                ih, mob_dist=dist, check_exit=check_exit, capture=_cap,
+            ):
+                log.debug("[move:correct] mob lost during re-orient – aborting walk")
+                break
+            log.debug("[move:correct] course corrected – resuming walk")
+
         if i % 5 == 4:
             log.debug(
                 f"[move:walk] step {i+1}/{max_clicks} – dist={dist:.2f} "
+                f"angle={mob_angle_deg:+.1f}° "
                 f"({(_time.monotonic()-_walk_t0)*1000:.0f}ms walk)"
             )
         if check_exit:
