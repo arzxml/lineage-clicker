@@ -861,7 +861,40 @@ class ScenarioRunner:
                     region_brightness = cv2.cvtColor(region_crop, cv2.COLOR_BGR2GRAY).mean()
                     b_ratio = region_brightness / tpl_brightness if tpl_brightness > 0 else 1.0
                     available = b_ratio >= brightness_ratio
-                    if not available:
+
+                    # Even if brightness looks OK, check for cooldown
+                    # timer overlay by comparing the center of the live
+                    # crop against the template.  Timer digits change the
+                    # center significantly; natural icon art matches.
+                    if available:
+                        gray_crop = cv2.cvtColor(region_crop, cv2.COLOR_BGR2GRAY)
+                        gray_tpl = cv2.cvtColor(tpl_img, cv2.COLOR_BGR2GRAY)
+                        # Resize template center to match crop if sizes differ slightly.
+                        h, w = gray_crop.shape[:2]
+                        ht, wt = gray_tpl.shape[:2]
+                        y1c, y2c = int(h * 0.2), int(h * 0.8)
+                        x1c, x2c = int(w * 0.2), int(w * 0.8)
+                        center_crop = gray_crop[y1c:y2c, x1c:x2c]
+                        y1t, y2t = int(ht * 0.2), int(ht * 0.8)
+                        x1t, x2t = int(wt * 0.2), int(wt * 0.8)
+                        center_tpl = gray_tpl[y1t:y2t, x1t:x2t]
+                        # Match sizes for diff
+                        ch, cw = center_crop.shape[:2]
+                        if center_tpl.shape[:2] != (ch, cw):
+                            center_tpl = cv2.resize(center_tpl, (cw, ch))
+                        diff = cv2.absdiff(center_crop, center_tpl).mean()
+                        timer_diff_thresh = getattr(config, "SKILL_TIMER_DIFF_THRESH", 25.0)
+                        if diff > timer_diff_thresh:
+                            available = False
+                            log.debug(
+                                f"[skill:check] {skill_name} = UNAVAILABLE "
+                                f"(timer overlay: center diff {diff:.1f} "
+                                f"> {timer_diff_thresh:.0f} threshold)"
+                            )
+
+                    if not available and b_ratio >= brightness_ratio:
+                        pass  # already logged above (timer overlay)
+                    elif not available:
                         log.debug(
                             f"[skill:check] {skill_name} = UNAVAILABLE "
                             f"(darkened: brightness {b_ratio:.2f} < {brightness_ratio})"

@@ -98,6 +98,7 @@ PRE_ORIENT_HP_THRESHOLD = 0.10  # roughly ≈15 % HP remaining
 # Skill availability
 SKILL_CHECK_INTERVAL = 3.0      # seconds between skill-window checks
 SKILL_BRIGHTNESS_RATIO = 0.90   # if matched region brightness < ratio * template brightness → on cooldown
+SKILL_TIMER_DIFF_THRESH = 25.0  # mean pixel diff between live center & template center → timer overlay
 
 # Combat skills to use during fights (template name = "skill-{key}").
 # Each entry: conditions (when to use), pre/post actions.
