@@ -75,7 +75,7 @@ LOOT_PRESS_DELAY = 0.05   # seconds between loot presses
 # Movement
 MOVE_CLICK_RADIUS = 700   # how far (px) from screen center to click when walking (directional)
 MOVE_FORWARD_CLICK_PX = 250  # how far above screen center to click when walking forward
-MOB_CLOSE_RANGE   = 0.09  # normalised minimap distance (0–1) at which mob is "close enough"
+MOB_CLOSE_RANGE   = 0.14  # normalised minimap distance (0–1) at which mob is "close enough" for F10
 MOB_MELEE_RANGE   = 0.03  # mob this close is likely attacking us — fight before looting
 
 # Camera
@@ -84,7 +84,7 @@ CAMERA_ROTATE_MAX_PX       = 50    # max px to drag left/right for a full 180° 
 CAMERA_PX_PER_RAD          = 19.0  # pixels of right-drag per radian of CW camera rotation (calibrated)
 CAMERA_NORTH_THRESHOLD_DEG = 15    # degrees – half-width of "north" cone (generous for rotation)
 CAMERA_STEP_PX             = 1     # px per nudge (1 = smallest possible mouse step)
-CAMERA_MAX_PASSES          = 180   # max nudge iterations before giving up
+CAMERA_MAX_PASSES          = 90    # max nudge iterations before giving up (~270° at 3°/nudge)
 CAMERA_SETTLE_MS           = 30    # ms to wait after each mouse move for the game to update
 CAMERA_RECENTER_EVERY      = 30    # re-grip mouse every N nudges to avoid drag-distance cap
 # Pre-orient: HP ratio below which the bot starts orienting to the next mob

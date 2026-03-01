@@ -67,28 +67,35 @@ def rotate_camera_toward_mob(
     north_cone_deg = getattr(config, "CAMERA_NORTH_THRESHOLD_DEG", 20)
     north_cone_rad = math.radians(north_cone_deg)
     step_px        = getattr(config, "CAMERA_STEP_PX", 1)
-    max_passes     = getattr(config, "CAMERA_MAX_PASSES", 180)
+    max_passes     = getattr(config, "CAMERA_MAX_PASSES", 90)
     settle_ms      = getattr(config, "CAMERA_SETTLE_MS", 30) / 1000.0
+    close_range    = getattr(config, "MOB_CLOSE_RANGE", 0.15)
 
-    def _tracked_mob_at_north(fr) -> bool:
-        """Check if the mob we're tracking (by *mob_dist*) is in the north cone.
+    def _any_mob_at_north(fr) -> bool:
+        """Check if ANY mob (respecting *min_dist*) is in the north cone.
 
-        Uses ``target_dist=mob_dist`` so that when multiple mobs exist,
-        we evaluate the one at the expected distance — not just the
-        nearest one (which may be a different mob off to the side).
+        During rotation only angles change — distances stay the same.
+        So we don't need to track a specific mob by distance; just
+        accept any eligible mob that enters north.
         """
-        tracked = vision.find_nearest_mob_on_minimap(
-            fr, target_dist=mob_dist, min_dist=min_dist,
-        )
-        if tracked is None:
-            return False
-        tdx, tdy, _ = tracked
-        return abs(math.atan2(tdx, -tdy)) <= north_cone_rad
+        for dx, dy, dist in vision._find_all_mobs_on_minimap(fr, min_dist=min_dist):
+            if abs(math.atan2(dx, -dy)) <= north_cone_rad:
+                return True
+        return False
 
-    # ── 1. Already have the target mob at north? ─────────────────
+    def _mob_entered_close_range(fr) -> bool:
+        """Check if any mob (ignoring min_dist) wandered into close range.
+
+        If so the rotation is pointless — the state machine can just
+        F10-target it.
+        """
+        nearest = vision.find_nearest_mob_on_minimap(fr)
+        return nearest is not None and nearest[2] <= close_range
+
+    # ── 1. Already have a mob at north? ──────────────────────────
     frame = _cap.grab()
-    if _tracked_mob_at_north(frame):
-        log.debug("[camera:rotate] tracked mob already at north – no rotation needed")
+    if _any_mob_at_north(frame):
+        log.debug("[camera:rotate] mob already at north – no rotation needed")
         return True
 
     # ── 2. Pick a committed direction ────────────────────────────
@@ -141,23 +148,33 @@ def rotate_camera_toward_mob(
 
             frame = _cap.grab()
 
-            if _tracked_mob_at_north(frame):
+            if _any_mob_at_north(frame):
                 log.debug(
-                    f"[camera:rotate] tracked mob entered north cone after {i+1} nudges"
+                    f"[camera:rotate] mob entered north cone after {i+1} nudges"
                 )
                 success = True
                 break
 
+            # A mob wandered into close range during rotation — stop
+            # spinning and let the state machine F10-target it.
+            if min_dist and _mob_entered_close_range(frame):
+                log.debug(
+                    f"[camera:rotate] mob entered close range during "
+                    f"rotation after {i+1} nudges – aborting"
+                )
+                success = True   # not a failure; a mob is right there
+                break
+
             # Periodic angle logging for diagnostics
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 20 == 0:
                 diag = vision.find_nearest_mob_on_minimap(
-                    frame, target_dist=mob_dist, min_dist=min_dist,
+                    frame, min_dist=min_dist,
                 )
                 if diag is not None:
                     _dx, _dy, _dist = diag
                     _ang = math.degrees(math.atan2(_dx, -_dy))
                     log.debug(
-                        f"[camera:rotate] nudge {i+1}: tracked mob at "
+                        f"[camera:rotate] nudge {i+1}: nearest mob at "
                         f"{_ang:+.1f}° dist={_dist:.2f}"
                     )
 
@@ -299,9 +316,23 @@ def move_to_closest_mob(
     # How far off-north (degrees) before we correct course mid-walk
     correct_threshold_deg = getattr(config, "MOVE_CORRECT_THRESHOLD_DEG", 35)
 
+    step_sleep = 0.35  # seconds per walk click
+
     for i in range(max_clicks):
         ih.click(walk_x, walk_y)
-        sleep(0.45)
+
+        # Split the wait into two halves with a mid-step range check
+        # so we notice approaching mobs faster.
+        sleep(step_sleep / 2)
+        mid_frame = _cap.grab()
+        mid_result = vision.find_nearest_mob_on_minimap(mid_frame)
+        if mid_result is not None and mid_result[2] <= close_range:
+            log.debug(
+                f"[move:walk] mob in range mid-step (dist={mid_result[2]:.2f}) "
+                f"after {i+1} steps ({(_time.monotonic()-_walk_t0)*1000:.0f}ms walk)"
+            )
+            break
+        sleep(step_sleep / 2)
 
         frame = _cap.grab()
         result = vision.find_nearest_mob_on_minimap(frame)
