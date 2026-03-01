@@ -37,6 +37,62 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def focus_game_window(title: str | None = None) -> bool:
+    """Find the game window by title and bring it to the foreground.
+
+    Returns True if the window was found and focused.
+    """
+    import ctypes
+    import ctypes.wintypes
+
+    title = title or getattr(config, "GAME_WINDOW_TITLE", "Lineage II")
+    user32 = ctypes.windll.user32
+
+    hwnd = user32.FindWindowW(None, title)
+    if not hwnd:
+        # Fallback: search for a window whose title *contains* the text
+        found: list[int] = []
+
+        def _enum_cb(h, _):
+            length = user32.GetWindowTextLengthW(h)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(h, buf, length + 1)
+                if title.lower() in buf.value.lower():
+                    found.append(h)
+            return True
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM,
+        )
+        user32.EnumWindows(WNDENUMPROC(_enum_cb), 0)
+        hwnd = found[0] if found else 0
+
+    if not hwnd:
+        log.warning(f"[focus] window '{title}' not found")
+        return False
+
+    # Restore if minimised
+    SW_RESTORE = 9
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+
+    # SetForegroundWindow may fail if we don't own the foreground.
+    # Attach to the foreground thread briefly to work around this.
+    fore = user32.GetForegroundWindow()
+    fore_tid = user32.GetWindowThreadProcessId(fore, None)
+    our_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+    if fore_tid != our_tid:
+        user32.AttachThreadInput(our_tid, fore_tid, True)
+    user32.SetForegroundWindow(hwnd)
+    user32.BringWindowToTop(hwnd)
+    if fore_tid != our_tid:
+        user32.AttachThreadInput(our_tid, fore_tid, False)
+
+    log.info(f"[focus] brought '{title}' (hwnd={hwnd:#x}) to foreground")
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────
 #  Exit watcher – background thread that checks for exit menu
 # ─────────────────────────────────────────────────────────────────────
@@ -108,12 +164,14 @@ async def bot_loop(
     scenarios = ScenarioRunner(remote_state=remote_state)
     capture = scenarios.capture
 
-    # Focus the game window by clicking center of the game monitor
+    # Focus the game window
     mon = capture.monitor
     cx = mon["left"] + mon["width"] // 2
     cy = mon["top"] + mon["height"] // 2
-    log.info(f"[bot] clicking game monitor center ({cx}, {cy}) to focus")
-    ih.click(cx, cy)
+    if not focus_game_window():
+        # Fallback: click center of the game monitor
+        log.info(f"[bot] window not found – clicking monitor center ({cx}, {cy})")
+        ih.click(cx, cy)
     await asyncio.sleep(0.3)
 
     # ── Quick input-health check ──────────────────────────────────

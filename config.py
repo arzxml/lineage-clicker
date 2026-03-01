@@ -11,6 +11,9 @@ SERVER_HOST = "0.0.0.0"  # server: bind address  /  client: server IP
 SERVER_PORT = 8765
 REMOTE_STATE_FILE = "remote_state.json"  # persisted snapshot of all remote characters
 
+# ── Game window ───────────────────────────────
+GAME_WINDOW_TITLE = "Lineage II"   # exact title-bar text (used to find & focus the window)
+
 # ── Screen capture ────────────────────────────
 # Monitor index (0 = all monitors, 1 = primary, 2 = secondary …)
 MONITOR_INDEX = 1
