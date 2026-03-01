@@ -1,7 +1,8 @@
 mss
 opencv-python
 numpy
-interception-python
+cffi
+interception
 websockets
 easyocr
 pywin32
