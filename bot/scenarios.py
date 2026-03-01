@@ -218,6 +218,10 @@ class ScenarioRunner:
         self.being_attacked: bool = False
         self._last_known_hp: int = 0
 
+        # Per-chain abort cooldown: chain_name → monotonic timestamp.
+        # After a timeout abort, the chain cannot re-trigger until this time.
+        self._chain_last_abort: dict[str, float] = {}
+
         # Cached hotbar positions: template_name → (cx, cy, tw, th)
         # Populated once at startup by _scan_hotbar() so we never need
         # runtime template matching on the hot bar.
@@ -1069,6 +1073,12 @@ class ScenarioRunner:
                 if self._chain_active:
                     continue
 
+                # Skip if this chain was recently aborted (cooldown).
+                abort_cooldown = getattr(config, "CHAIN_ABORT_COOLDOWN", 10.0)
+                last_abort = self._chain_last_abort.get(chain_name, 0.0)
+                if _time.monotonic() - last_abort < abort_cooldown:
+                    continue
+
                 skills = chain_cfg.get("skills", [])
                 all_avail = all(
                     self.skill_availability.get(s, {}).get("available", False)
@@ -1100,6 +1110,14 @@ class ScenarioRunner:
                     hp_pct = (self.hp_current / self.hp_max * 100) if self.hp_max > 0 else 100
                     if hp_pct > char_hp_thresh:
                         continue
+
+                # Require confirmed combat (HP damage detected).
+                if conditions.get("require_being_attacked") and not self.being_attacked:
+                    log.debug(
+                        f"[chain:{chain_name}] waiting for confirmed damage "
+                        f"(being_attacked=False)"
+                    )
+                    continue
 
                 # Target HP below threshold (only meaningful while
                 # attacking – confirms we've been fighting a while).
@@ -1168,6 +1186,7 @@ class ScenarioRunner:
                     )
                     self._chain_phase[chain_name] = "monitoring"
                     self._chain_active = False
+                    self._chain_last_abort[chain_name] = _time.monotonic()
                     ih.press(config.KEY_ATTACK)
                     self._last_attack_press = _time.monotonic()
                     self.being_attacked = False
@@ -1184,6 +1203,7 @@ class ScenarioRunner:
                         )
                         self._chain_phase[chain_name] = "monitoring"
                         self._chain_active = False
+                        self._chain_last_abort[chain_name] = _time.monotonic()
                         ih.press(config.KEY_ATTACK)
                         self._last_attack_press = _time.monotonic()
                         self.being_attacked = False

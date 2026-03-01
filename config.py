@@ -160,6 +160,7 @@ SKILL_CHAINS: dict[str, dict] = {
         "conditions": {
             "max_nearby_mobs": 3,
             "target_hp_below_percent": 70,
+            "require_being_attacked": True,
         },
         "preparation": {
             "stop_attack": True,
@@ -195,6 +196,10 @@ SKILL_CHAINS: dict[str, dict] = {
 # If HP doesn't drop to the target within this time, the chain aborts
 # and normal combat resumes.
 CHAIN_HP_WAIT_TIMEOUT = 30.0
+
+# Cooldown (seconds) after a chain abort before it can re-trigger.
+# Prevents the chain from immediately re-entering after a timeout.
+CHAIN_ABORT_COOLDOWN = 10.0
 
 # Patrol zone
 PATROL_CHECK_INTERVAL = 30.0    # seconds between map checks
