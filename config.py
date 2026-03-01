@@ -145,8 +145,8 @@ SKILL_CHAINS: dict[str, dict] = {
         },
         "preparation": {
             "stop_attack": True,
-            "wait_hp_below_percent": 30,
             "equip_item": "Knife",
+            "wait_hp_below_percent": 30,
         },
         "cleanup": {
             "equip_item": "Elven Long Sword"

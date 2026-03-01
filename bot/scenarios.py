@@ -1054,9 +1054,19 @@ class ScenarioRunner:
                     # keeping the target selected; mobs keep hitting us
                     log.info(
                         f"[chain:{chain_name}] all skills ready – "
-                        f"stepping back to stop attack and take damage"
+                        f"stepping back to stop attack"
                     )
                     ih.press(config.KEY_MOVE_BACK)
+                    sleep(0.5)  # let the character fully stop
+
+                    # Equip item (e.g. Knife) while character is idle,
+                    # before we start waiting for HP to drop.
+                    prep_equip = {k: v for k, v in prep.items() if k == "equip_item"}
+                    if prep_equip:
+                        fresh = self.capture.grab()
+                        self._execute_buff_action(prep_equip, fresh, matcher, ih)
+                        sleep(0.2)
+
                     self._chain_active = True
                     self._chain_stop_attack_time = _time.monotonic()
                     self._chain_phase[chain_name] = "waiting_hp"
@@ -1089,6 +1099,9 @@ class ScenarioRunner:
                     # Resume attack (target still selected)
                     ih.press(config.KEY_ATTACK)
                     self._last_attack_press = _time.monotonic()
+                    # Reset combat timer so the minimum-combat gate
+                    # prevents the chain from immediately re-entering.
+                    self._chain_combat_start = _time.monotonic()
                 else:
                     # Re-check mob count – if it increased, abort for safety
                     conditions = chain_cfg.get("conditions", {})
@@ -1103,6 +1116,7 @@ class ScenarioRunner:
                         self._chain_active = False
                         ih.press(config.KEY_ATTACK)
                         self._last_attack_press = _time.monotonic()
+                        self._chain_combat_start = _time.monotonic()
 
             # ── EXECUTING: run pre → skills → post → resume ──────────
             if self._chain_phase.get(chain_name) == "executing":
@@ -1118,17 +1132,17 @@ class ScenarioRunner:
         matcher: TemplateMatcher,
         ih: InputHandler,
     ) -> None:
-        """Run a complete skill chain: preparation → skills → cleanup → attack."""
+        """Run a complete skill chain: skills → cleanup → attack.
+
+        Preparation (stop attack, equip) has already been handled by the
+        MONITORING phase before entering EXECUTING.
+        """
         _t0 = _time.monotonic()
 
-        # Preparation action (e.g. equip Knife)
-        # Target is still selected (we only stepped back, not deselected)
-        prep = chain_cfg.get("preparation", {})
-        prep_equip = {k: v for k, v in prep.items() if k == "equip_item"}
-        if prep_equip:
-            fresh = self.capture.grab()
-            self._execute_buff_action(prep_equip, fresh, matcher, ih)
-            sleep(0.2)
+        # Ensure the character is fully idle (no attack animation)
+        # before clicking any skills – press back again and wait.
+        ih.press(config.KEY_MOVE_BACK)
+        sleep(0.5)
 
         # Execute each skill in order
         delay = chain_cfg.get("delay_between_skills", 0.3)
