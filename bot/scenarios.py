@@ -140,18 +140,6 @@ class StatsReader:
         r.mp_current, r.mp_max = mp_cur, mp_max
         r.xp_percent = xp_pct
 
-        # Detect HP drop while attacking – confirms real combat.
-        if r._state == BotState.ATTACKING and not r._chain_hp_damaged:
-            if r._chain_last_hp == 0 and hp_cur > 0:
-                # First valid OCR reading – adopt as baseline.
-                r._chain_last_hp = hp_cur
-            elif r._chain_last_hp > 0 and hp_cur < r._chain_last_hp:
-                r._chain_hp_damaged = True
-                log.debug(
-                    f"[chain:hp_damage] HP dropped {r._chain_last_hp} → {hp_cur} "
-                    f"– combat confirmed"
-                )
-
         # Build event for the main loop to publish
         cp_ratio = cp_cur / cp_max if cp_max > 0 else 0.0
         hp_ratio = hp_cur / hp_max if hp_max > 0 else 0.0
@@ -223,10 +211,12 @@ class ScenarioRunner:
         # Suppresses engage_target re-presses and detect_target_death.
         self._chain_active: bool = False
         self._chain_stop_attack_time: float = 0.0
-        # True once HP drops while ATTACKING – confirms real combat.
-        # Set by StatsReader._apply(), reset on entering ATTACKING.
-        self._chain_hp_damaged: bool = False
-        self._chain_last_hp: int = 0
+
+        # True when the character is taking damage (HP dropping).
+        # Updated every tick by update_tick(), reset on entering ATTACKING.
+        # Available to all scenarios.
+        self.being_attacked: bool = False
+        self._last_known_hp: int = 0
 
         # Cached hotbar positions: template_name → (cx, cy, tw, th)
         # Populated once at startup by _scan_hotbar() so we never need
@@ -256,14 +246,37 @@ class ScenarioRunner:
             log.debug(f"[state:transition] {self._state.value} → {state.value}")
             if state == BotState.ATTACKING:
                 # Reset HP-damage tracking for the new combat encounter.
-                self._chain_hp_damaged = False
-                self._chain_last_hp = self.hp_current  # may be 0 if OCR not ready
+                self.being_attacked = False
+                self._last_known_hp = self.hp_current  # may be 0 if OCR not ready
         self._state = state
 
     def _clear_state(self) -> None:
         if self._state != BotState.IDLE:
             log.debug(f"[state:transition] {self._state.value} → idle")
         self._state = BotState.IDLE
+
+    def update_tick(self) -> None:
+        """Per-tick updates called before scenarios run.
+
+        Maintains shared flags (e.g. ``being_attacked``) that any
+        scenario can read.
+        """
+        # Detect HP damage – confirms the character is being hit.
+        if self._state == BotState.ATTACKING and not self.being_attacked:
+            hp_now = self.hp_current
+            if self._last_known_hp == 0 and hp_now > 0:
+                # First valid OCR reading – adopt as baseline.
+                self._last_known_hp = hp_now
+            elif self._last_known_hp > 0 and hp_now < self._last_known_hp:
+                self.being_attacked = True
+                log.debug(
+                    f"[combat:hp_drop] HP {self._last_known_hp} → {hp_now} "
+                    f"– being_attacked = True"
+                )
+            elif hp_now > self._last_known_hp:
+                # HP went up (regen) – ratchet baseline so the next
+                # real damage tick is detected relative to the new peak.
+                self._last_known_hp = hp_now
 
     def _check_exit(self, matcher: TemplateMatcher) -> None:
         """Grab a fresh frame and raise BotStopRequested if exit menu is visible."""
@@ -1012,26 +1025,42 @@ class ScenarioRunner:
         bus: EventBus,
         event: Optional[dict] = None,
     ) -> None:
-        """Monitor and execute skill chains during combat.
+        """Monitor and execute skill chains.
 
-        A chain fires when ALL its skills are off cooldown, the bot is
-        ATTACKING, and safety conditions are met (mob count).  The chain
-        then optionally stops auto-attack, waits for HP to drop, equips
-        items, uses every skill in order, re-equips and resumes combat.
+        Each chain declares ``allowed_states`` (defaults to
+        ``["attacking"]``).  A chain fires when ALL its skills are off
+        cooldown, the bot is in one of those states, and every
+        condition is satisfied (mob count, character HP, target HP,
+        etc.).
         """
-        # If we left combat, reset any in-progress chain
-        if self._state != BotState.ATTACKING:
-            if self._chain_active:
-                log.debug("[chain:reset] left ATTACKING state – resetting chains")
-                for name in self._chain_phase:
-                    self._chain_phase[name] = "monitoring"
-                self._chain_active = False
-            return
+        # Reset any in-progress chain whose allowed states no longer
+        # match the current bot state.
+        cur_state = self._state.value
+        for chain_name, chain_cfg in self.skill_chains.items():
+            phase = self._chain_phase.get(chain_name, "monitoring")
+            if phase != "monitoring":
+                allowed = chain_cfg.get("allowed_states", ["attacking"])
+                if cur_state not in allowed:
+                    log.debug(
+                        f"[chain:{chain_name}] state '{cur_state}' left "
+                        f"allowed {allowed} – resetting from {phase}"
+                    )
+                    self._chain_phase[chain_name] = "monitoring"
+        # Clear the active guard if no chain is in progress.
+        if self._chain_active and all(
+            p == "monitoring" for p in self._chain_phase.values()
+        ):
+            self._chain_active = False
 
         for chain_name, chain_cfg in sorted(
             self.skill_chains.items(),
             key=lambda item: item[1].get("priority", 99),
         ):
+            # Skip chains not valid for the current state.
+            allowed = chain_cfg.get("allowed_states", ["attacking"])
+            if cur_state not in allowed:
+                continue
+
             phase = self._chain_phase.get(chain_name, "monitoring")
 
             # ── MONITORING: wait for all skills to come off cooldown ──
@@ -1048,9 +1077,10 @@ class ScenarioRunner:
                 if not all_avail:
                     continue
 
+                conditions = chain_cfg.get("conditions", {})
+
                 # Check require_unavailable: skip if listed skills
                 # are available (a higher-priority chain should fire).
-                conditions = chain_cfg.get("conditions", {})
                 req_unavail = conditions.get("require_unavailable", [])
                 if req_unavail:
                     any_avail = any(
@@ -1064,28 +1094,38 @@ class ScenarioRunner:
                         )
                         continue
 
-                # Require confirmed combat damage before triggering.
-                # The OCR thread sets _chain_hp_damaged once HP drops.
-                if not self._chain_hp_damaged:
-                    log.debug(
-                        f"[chain:{chain_name}] no HP damage detected yet "
-                        f"– keep attacking"
-                    )
-                    continue
+                # Character HP below threshold (e.g. preemptive chain).
+                char_hp_thresh = conditions.get("hp_below_percent")
+                if char_hp_thresh is not None:
+                    hp_pct = (self.hp_current / self.hp_max * 100) if self.hp_max > 0 else 100
+                    if hp_pct > char_hp_thresh:
+                        continue
+
+                # Target HP below threshold (only meaningful while
+                # attacking – confirms we've been fighting a while).
+                target_hp_thresh = conditions.get("target_hp_below_percent")
+                if target_hp_thresh is not None:
+                    target_hp_pct = vision.target_hp_ratio(frame) * 100
+                    if target_hp_pct < 1 or target_hp_pct > target_hp_thresh:
+                        # < 1 % means dead / no target → skip
+                        continue
 
                 # Check safety: mob count
-                conditions = chain_cfg.get("conditions", {})
                 max_mobs = conditions.get("max_nearby_mobs", 999)
-                mob_count = vision.count_mobs_on_minimap(frame, max_dist=config.MOB_CLOSE_RANGE)
-                if mob_count > max_mobs:
-                    log.debug(
-                        f"[chain:{chain_name}] {mob_count} mobs on minimap "
-                        f"(max {max_mobs}) – too risky, skipping"
+                if max_mobs < 999:
+                    mob_count = vision.count_mobs_on_minimap(
+                        frame, max_dist=config.MOB_CLOSE_RANGE,
                     )
-                    continue
+                    if mob_count > max_mobs:
+                        log.debug(
+                            f"[chain:{chain_name}] {mob_count} mobs on minimap "
+                            f"(max {max_mobs}) – too risky, skipping"
+                        )
+                        continue
 
+                # Determine execution path.
                 prep = chain_cfg.get("preparation", {})
-                if prep.get("stop_attack"):
+                if prep.get("stop_attack") and self._state == BotState.ATTACKING:
                     # Press back-arrow to interrupt auto-attack while
                     # keeping the target selected; mobs keep hitting us
                     log.info(
@@ -1100,6 +1140,10 @@ class ScenarioRunner:
                     self._chain_phase[chain_name] = "waiting_hp"
                 else:
                     # No HP-wait needed – execute immediately
+                    log.info(
+                        f"[chain:{chain_name}] conditions met in state "
+                        f"'{cur_state}' – executing"
+                    )
                     self._chain_active = True
                     self._chain_phase[chain_name] = "executing"
 
@@ -1124,13 +1168,10 @@ class ScenarioRunner:
                     )
                     self._chain_phase[chain_name] = "monitoring"
                     self._chain_active = False
-                    # Resume attack (target still selected)
                     ih.press(config.KEY_ATTACK)
                     self._last_attack_press = _time.monotonic()
-                    # Reset damage flag so chain won't immediately re-enter;
-                    # OCR must detect a new HP drop first.
-                    self._chain_hp_damaged = False
-                    self._chain_last_hp = self.hp_current
+                    self.being_attacked = False
+                    self._last_known_hp = self.hp_current
                 else:
                     # Re-check mob count – if it increased, abort for safety
                     conditions = chain_cfg.get("conditions", {})
@@ -1145,18 +1186,16 @@ class ScenarioRunner:
                         self._chain_active = False
                         ih.press(config.KEY_ATTACK)
                         self._last_attack_press = _time.monotonic()
-                        self._chain_hp_damaged = False
-                        self._chain_last_hp = self.hp_current
+                        self.being_attacked = False
+                        self._last_known_hp = self.hp_current
 
             # ── EXECUTING: run skills → after → resume ──────────
             if self._chain_phase.get(chain_name) == "executing":
                 self._execute_chain(chain_name, chain_cfg, frame, matcher, ih)
                 self._chain_phase[chain_name] = "monitoring"
                 self._chain_active = False
-                # Reset damage flag so chain won't retrigger until
-                # a new HP drop is detected.
-                self._chain_hp_damaged = False
-                self._chain_last_hp = self.hp_current
+                self.being_attacked = False
+                self._last_known_hp = self.hp_current
 
     def _execute_chain(
         self,
@@ -1172,10 +1211,10 @@ class ScenarioRunner:
         """
         _t0 = _time.monotonic()
 
-        # Ensure the character is fully idle (no attack animation)
-        # before clicking any skills – press back again and wait.
-        ih.press(config.KEY_MOVE_BACK)
-        sleep(0.5)
+        # Only interrupt attack animation if actively in combat.
+        if self._state == BotState.ATTACKING:
+            ih.press(config.KEY_MOVE_BACK)
+            sleep(0.5)
 
         # Execute 'before' actions (e.g. equip Knife)
         before = chain_cfg.get("before", {})
@@ -1218,12 +1257,13 @@ class ScenarioRunner:
             self._execute_buff_action(after, fresh, matcher, ih)
             sleep(0.2)
 
-        # Resume attack
-        ih.press(config.KEY_ATTACK)
-        self._last_attack_press = _time.monotonic()
+        # Resume attack if we have a target (combat or just-acquired).
+        if self._state in (BotState.ATTACKING, BotState.TARGET_ACQUIRED):
+            ih.press(config.KEY_ATTACK)
+            self._last_attack_press = _time.monotonic()
         log.info(
             f"[chain:{chain_name}] complete "
-            f"({(_time.monotonic() - _t0) * 1000:.0f}ms) – resuming attack"
+            f"({(_time.monotonic() - _t0) * 1000:.0f}ms)"
         )
 
     # ── OCR-based stat reading (moved to StatsReader background thread) ──

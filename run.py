@@ -232,6 +232,7 @@ async def bot_loop(
 
             # Run each active scenario once per tick
             slow_threshold_ms = 50  # log scenarios slower than this
+            scenarios.update_tick()
             for scenario_fn in active_scenarios:
                 ev = remote_events[0] if remote_events else None
                 try:

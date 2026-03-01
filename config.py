@@ -37,9 +37,9 @@ TEMPLATES_DIR = "assets/templates"
 ACTIVE_SCENARIOS: list[str] = [
     "process_remote_events",
     "scan_skill_cooldowns",
+    "execute_skill_chains",
     "apply_buffs",
     "update_toggle_skills",
-    "execute_skill_chains",
     "detect_target_death",
     "loot_target",
     "scan_nearby_mobs",
@@ -96,7 +96,7 @@ CAMERA_RECENTER_EVERY      = 30    # re-grip mouse every N nudges to avoid drag-
 PRE_ORIENT_HP_THRESHOLD = 0.10  # roughly ≈15 % HP remaining
 
 # Skill availability
-SKILL_CHECK_INTERVAL = 10.0     # seconds between skill-window checks
+SKILL_CHECK_INTERVAL = 3.0      # seconds between skill-window checks
 SKILL_BRIGHTNESS_RATIO = 0.90   # if matched region brightness < ratio * template brightness → on cooldown
 
 # Combat skills to use during fights (template name = "skill-{key}").
@@ -138,11 +138,28 @@ TOGGLE_SKILLS: dict[str, dict] = {
 # After execution every skill enters cooldown so the chain
 # won't re-trigger until they're all available again.
 SKILL_CHAINS: dict[str, dict] = {
-    "destroyer_burst": {
-        "priority": 1,           # lower = higher priority
+    "destroyer_burst_preemptive": {
+        "priority": 0,           # highest – fire before combat if HP is already low
         "skills": ["Rage", "Frenzy", "Battle Roar"],
+        "allowed_states": ["target_acquired", "attacking"],
+        "conditions": {
+            "hp_below_percent": 30,
+        },
+        "before": {
+            "equip_item": "Knife",
+        },
+        "after": {
+            "equip_item": "Elven Long Sword"
+        },
+        "delay_between_skills": 1,
+    },
+    "destroyer_burst": {
+        "priority": 1,
+        "skills": ["Rage", "Frenzy", "Battle Roar"],
+        "allowed_states": ["attacking"],
         "conditions": {
             "max_nearby_mobs": 3,
+            "target_hp_below_percent": 70,
         },
         "preparation": {
             "stop_attack": True,
@@ -159,6 +176,7 @@ SKILL_CHAINS: dict[str, dict] = {
     "rage_only": {
         "priority": 2,
         "skills": ["Rage"],
+        "allowed_states": ["target_acquired", "attacking"],
         "conditions": {
             "max_nearby_mobs": 3,
             "require_unavailable": ["Frenzy"],  # only when Frenzy is on cooldown
