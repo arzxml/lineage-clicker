@@ -211,9 +211,9 @@ class ScenarioRunner:
         # Suppresses engage_target re-presses and detect_target_death.
         self._chain_active: bool = False
         self._chain_stop_attack_time: float = 0.0
-        # HP snapshot when entering ATTACKING – chains only fire after
-        # this value has decreased (confirming actual combat damage).
-        self._chain_hp_at_combat_start: int = 0
+        # Timestamp when we entered ATTACKING – chains require a
+        # minimum combat duration before they may fire.
+        self._chain_combat_start: float = 0.0
 
         # Cached hotbar positions: template_name → (cx, cy, tw, th)
         # Populated once at startup by _scan_hotbar() so we never need
@@ -242,8 +242,7 @@ class ScenarioRunner:
         if self._state != state:
             log.debug(f"[state:transition] {self._state.value} → {state.value}")
             if state == BotState.ATTACKING:
-                self._chain_hp_at_combat_start = self.hp_current
-                log.debug(f"[chain:hp_snapshot] recorded HP {self.hp_current} at combat start")
+                self._chain_combat_start = _time.monotonic()
         self._state = state
 
     def _clear_state(self) -> None:
@@ -1027,22 +1026,14 @@ class ScenarioRunner:
                 if not all_avail:
                     continue
 
-                # Require combat damage before triggering the chain.
-                # If HP hasn't dropped since we entered ATTACKING,
-                # the bot hasn't truly engaged yet – keep fighting.
-                hp_ref = self._chain_hp_at_combat_start
-                if hp_ref == 0 and self.hp_current > 0:
-                    # OCR wasn't ready when we entered ATTACKING –
-                    # adopt the first valid reading as our baseline.
-                    self._chain_hp_at_combat_start = self.hp_current
-                    hp_ref = self.hp_current
+                # Require minimum combat time so the bot lands a
+                # few hits before stopping for the chain sequence.
+                min_secs = getattr(config, "CHAIN_MIN_COMBAT_SECS", 3.0)
+                elapsed = _time.monotonic() - self._chain_combat_start
+                if elapsed < min_secs:
                     log.debug(
-                        f"[chain:{chain_name}] late HP snapshot: {hp_ref}"
-                    )
-                if hp_ref == 0 or self.hp_current >= hp_ref:
-                    log.debug(
-                        f"[chain:{chain_name}] HP {self.hp_current}/{hp_ref} "
-                        f"– no damage taken yet, keep attacking"
+                        f"[chain:{chain_name}] combat for {elapsed:.1f}s "
+                        f"(need {min_secs:.1f}s) – keep attacking"
                     )
                     continue
 

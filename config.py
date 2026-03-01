@@ -160,6 +160,10 @@ SKILL_CHAINS: dict[str, dict] = {
 # and normal combat resumes.
 CHAIN_HP_WAIT_TIMEOUT = 30.0
 
+# Minimum seconds to spend attacking before a skill chain can trigger.
+# Ensures the bot lands a few hits before stopping for the sequence.
+CHAIN_MIN_COMBAT_SECS = 3.0
+
 # Patrol zone
 PATROL_CHECK_INTERVAL = 30.0    # seconds between map checks
 PATROL_MAX_DRIFT_PX   = 60      # px offset on map before bot walks back
