@@ -139,6 +139,7 @@ TOGGLE_SKILLS: dict[str, dict] = {
 # won't re-trigger until they're all available again.
 SKILL_CHAINS: dict[str, dict] = {
     "destroyer_burst": {
+        "priority": 1,           # lower = higher priority
         "skills": ["Rage", "Frenzy", "Battle Roar"],
         "conditions": {
             "max_nearby_mobs": 3,
@@ -155,16 +156,21 @@ SKILL_CHAINS: dict[str, dict] = {
         },
         "delay_between_skills": 1,
     },
+    "rage_only": {
+        "priority": 2,
+        "skills": ["Rage"],
+        "conditions": {
+            "max_nearby_mobs": 3,
+            "require_unavailable": ["Frenzy"],  # only when Frenzy is on cooldown
+        },
+        "delay_between_skills": 0.3,
+    },
 }
 
 # Safety timeout (seconds) for the HP-wait phase of a skill chain.
 # If HP doesn't drop to the target within this time, the chain aborts
 # and normal combat resumes.
 CHAIN_HP_WAIT_TIMEOUT = 30.0
-
-# Minimum seconds to spend attacking before a skill chain can trigger.
-# Ensures the bot lands a few hits before stopping for the sequence.
-CHAIN_MIN_COMBAT_SECS = 3.0
 
 # Patrol zone
 PATROL_CHECK_INTERVAL = 30.0    # seconds between map checks
