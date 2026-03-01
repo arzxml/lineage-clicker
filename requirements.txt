@@ -4,3 +4,4 @@ numpy
 interception-python
 websockets
 easyocr
+pywin32
